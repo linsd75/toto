@@ -49,7 +49,7 @@ print()
 # ============================================================================
 
 print("Step 1: Loading ToTo Historical Data...")
-df = pd.read_csv('ToTo-26_Jan_2026.csv')
+df = pd.read_csv('ToTo-12_Feb_2026.csv')
 print(f"[OK] Loaded {len(df)} historical draws")
 print(f"[OK] Date range: {df['Date'].iloc[-1]} to {df['Date'].iloc[0]}")
 print(f"[OK] Columns: {list(df.columns)}")
