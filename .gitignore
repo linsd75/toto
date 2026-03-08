@@ -1,0 +1,25 @@
+
+# Ignore folders
+models/
+__pycache__/
+.git/
+
+# Ignore VS Code settings
+.vscode/
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore environment files
+.venv_tf_cuda
+
+# Ignore file types
+*.log
+*.tmp
+*.*bak
+*.html
+*.md
+*.json
+*.csv
+*.ps1

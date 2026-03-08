@@ -10,8 +10,8 @@ from tqdm import tqdm
 import time
 
 # Configuration
-DATA_FILE = r'C:\Users\shaodunlin\OneDrive - Microsoft\VSCODE\4D_results_26_Jan_2026.csv'
-OUTPUT_FILE = r'C:\Users\shaodunlin\OneDrive - Microsoft\VSCODE\Predict_4D_26_Jan_2026.md'
+DATA_FILE = r'C:\Users\shaodunlin\OneDrive - Microsoft\VSCODE\4D_results_14_Feb_2026.csv'
+OUTPUT_FILE = r'C:\Users\shaodunlin\OneDrive - Microsoft\VSCODE\Predict_4D_14_Feb_2026.md'
 SEQUENCE_LENGTH = 20  # Double the sequence history
 BATCH_SIZE = 128      # Larger batches for better parallelization
 HIDDEN_SIZE = 2048    # Significantly larger hidden state
