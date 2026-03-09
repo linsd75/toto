@@ -104,12 +104,12 @@ WIN_COLS = ["Win_1", "Win_2", "Win_3", "Win_4", "Win_5", "Win_6"]
 PRIMARY_COLS = WIN_COLS + ["Addl No."]
 
 BLEND_WEIGHTS = {
-    "model_soft": 0.50,
-    "model_set": 0.56,
-    "cluster": 0.74,
-    "repel": 0.07,
-    "addl_model": 0.68,
-    "addl_cluster": 0.44,
+    "model_soft": 0.9586,
+    "model_set": 0.3586,
+    "cluster": 0.4802,
+    "repel": 0.1677,
+    "addl_model": 0.3917,
+    "addl_cluster": 0.3867,
 }
 
 WIN_BLEND_KEYS = ["model_soft", "model_set", "cluster"]
@@ -138,18 +138,17 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ToTo Predication Report"
     )
-    parser.add_argument("--profile", default="", help="Named frozen parameter profile (example: s42_a_prod)")
     parser.add_argument("--seed", type=int, default=SEED, help="Global random seed")
     parser.add_argument("--sweep-mode", action="store_true", help="Use lighter settings for automated multi-run sweeps")
     parser.add_argument("--csv", default="ToTo-05_Mar_2026.csv", help="Input CSV file path")
     parser.add_argument("--clusters", type=int, default=0, help="Force KMeans clusters (0=auto)")
-    parser.add_argument("--tune-trials", type=int, default=22, help="Random trials sampled from config space")
+    parser.add_argument("--tune-trials", type=int, default=14, help="Random trials sampled from config space")
     parser.add_argument("--tune-folds", type=int, default=3, help="Walk-forward folds per tuning trial")
-    parser.add_argument("--tune-epochs", type=int, default=18, help="Epoch cap for each tuning fold")
-    parser.add_argument("--multi-restarts", type=int, default=1, help="Number of final-training restarts (best restart kept by hit objective)")
-    parser.add_argument("--final-epochs", type=int, default=110, help="Final training epoch cap")
+    parser.add_argument("--tune-epochs", type=int, default=10, help="Epoch cap for each tuning fold")
+    parser.add_argument("--multi-restarts", type=int, default=5, help="Number of final-training restarts (best restart kept by hit objective)")
+    parser.add_argument("--final-epochs", type=int, default=64, help="Final training epoch cap")
     parser.add_argument("--backtest-folds", type=int, default=10, help="Expanding-window backtest folds")
-    parser.add_argument("--backtest-epochs", type=int, default=26, help="Epoch cap per backtest fold")
+    parser.add_argument("--backtest-epochs", type=int, default=20, help="Epoch cap per backtest fold")
     parser.add_argument(
         "--focus-last-n",
         type=int,
@@ -162,22 +161,58 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-repel", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["repel"], help="Feature weight for repel features")
     parser.add_argument("--w-cluster", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["cluster"], help="Feature weight for cluster-prior features")
     parser.add_argument("--w-line", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["line"], help="Feature weight for line-endpoint convergence features")
-    parser.add_argument("--gpu-preallocate", action="store_true", help="Reserve near-full GPU memory instead of growth mode")
-    parser.add_argument("--gpu-batch-size", type=int, default=0, help="Override model training batch size")
-    parser.add_argument("--diffusion-batch-size", type=int, default=0, help="Override diffusion training batch size")
-    parser.add_argument("--reward-epochs", type=int, default=6, help="Reward-guided self-improvement epochs after final training")
-    parser.add_argument("--reward-window", type=int, default=240, help="Recent sequence samples used for reward refinement")
+    parser.add_argument(
+        "--perf-mode",
+        choices=["auto", "high"],
+        default="high",
+        help="Hardware/runtime tuning mode (high tries larger batches and faster execution settings)",
+    )
+    parser.add_argument(
+        "--gpu-preallocate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reserve near-full GPU memory instead of growth mode",
+    )
+    parser.add_argument("--gpu-batch-size", type=int, default=320, help="Override model training batch size")
+    parser.add_argument("--diffusion-batch-size", type=int, default=128, help="Override diffusion training batch size")
+    parser.add_argument("--steps-per-execution", type=int, default=32, help="Keras steps_per_execution (0 = auto)")
+    parser.add_argument(
+        "--dataset-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Cache tf.data datasets in RAM to reduce input overhead",
+    )
+    parser.add_argument(
+        "--train-recency-weighted",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use recency-weighted sample weights during model training",
+    )
+    parser.add_argument("--reward-epochs", type=int, default=10, help="Reward-guided self-improvement epochs after final training")
+    parser.add_argument("--reward-window", type=int, default=320, help="Recent sequence samples used for reward refinement")
     parser.add_argument("--reward-min-samples", type=int, default=64, help="Minimum reward refinement sample count")
-    parser.add_argument("--hit-score-focused", action="store_true", help="Auto-increase search depth and recent-window emphasis for hit-score optimization")
-    parser.add_argument("--blend-random-candidates", type=int, default=1600, help="Random blend candidates evaluated before coordinate-ascent refinement")
-    parser.add_argument("--blend-coordinate-iters", type=int, default=7, help="Coordinate-ascent iterations after random blend search")
-    parser.add_argument("--blend-coordinate-step", type=float, default=0.34, help="Initial coordinate-ascent relative step size")
-    parser.add_argument("--blend-simplex-iters", type=int, default=56, help="Local Nelder-Mead iterations after coordinate-ascent")
-    parser.add_argument("--blend-simplex-step", type=float, default=0.18, help="Initial simplex step size in transformed blend space")
-    parser.add_argument("--blend-tail-iters", type=int, default=4, help="Tail-hit local refinement iterations after Nelder-Mead")
-    parser.add_argument("--blend-tail-candidates", type=int, default=160, help="Candidates evaluated per tail-hit refinement iteration")
-    parser.add_argument("--backtest-local-random-candidates", type=int, default=560, help="Local blend random candidates used inside strict walk-forward backtest")
-    parser.add_argument("--backtest-optimize-avg", action="store_true", help="Optimize strict walk-forward local blend for avg_win_hits emphasis")
+    parser.add_argument(
+        "--hit-score-focused",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-increase search depth and recent-window emphasis for hit-score optimization",
+    )
+    parser.add_argument("--blend-random-candidates", type=int, default=3600, help="Random blend candidates evaluated before coordinate-ascent refinement")
+    parser.add_argument("--blend-coordinate-iters", type=int, default=14, help="Coordinate-ascent iterations after random blend search")
+    parser.add_argument("--blend-coordinate-step", type=float, default=0.42, help="Initial coordinate-ascent relative step size")
+    parser.add_argument("--blend-simplex-iters", type=int, default=160, help="Local Nelder-Mead iterations after coordinate-ascent")
+    parser.add_argument("--blend-simplex-step", type=float, default=0.24, help="Initial simplex step size in transformed blend space")
+    parser.add_argument("--blend-tail-iters", type=int, default=8, help="Tail-hit local refinement iterations after Nelder-Mead")
+    parser.add_argument("--blend-tail-candidates", type=int, default=360, help="Candidates evaluated per tail-hit refinement iteration")
+    parser.add_argument("--backtest-local-random-candidates", type=int, default=2600, help="Local blend random candidates used inside strict walk-forward backtest")
+    parser.add_argument("--backtest-restarts", type=int, default=1, help="Model restarts per walk-forward step (recent-focus mode)")
+    parser.add_argument("--restart-ensemble-topk", type=int, default=1, help="Average top-K restarts per walk-forward step")
+    parser.add_argument(
+        "--backtest-optimize-avg",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Optimize strict walk-forward local blend for avg_win_hits emphasis",
+    )
     parser.add_argument(
         "--feature-weight-trials",
         type=int,
@@ -193,83 +228,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--diffusion-window",
         type=int,
-        default=160,
+        default=180,
         help="Recent rows used for diffusion pattern image (clamped to available rows)",
     )
     parser.add_argument(
         "--diffusion-steps",
         type=int,
-        default=64,
+        default=72,
         help="DDPM denoising steps",
     )
     parser.add_argument(
         "--diffusion-epochs",
         type=int,
-        default=10,
+        default=14,
         help="Epochs per diffusion trial",
     )
     parser.add_argument(
         "--diffusion-trials",
         type=int,
-        default=3,
+        default=5,
         help="Number of diffusion hyperparameter trials",
     )
     parser.add_argument(
         "--diffusion-samples",
         type=int,
-        default=8,
+        default=12,
         help="Images sampled per diffusion trial for score selection",
     )
     parser.add_argument(
         "--diffusion-future-samples",
         type=int,
-        default=160,
+        default=240,
         help="Synthetic windows used for diffusion next-day prediction",
     )
     return parser.parse_args()
 
 
-def apply_named_profile(args: argparse.Namespace) -> None:
-    profile = str(getattr(args, "profile", "") or "").strip().lower()
-    if not profile:
-        return
-    if profile == "s42_a_prod":
-        # Frozen production profile from report_01_s42_A.html.
-        args.seed = 42
-        args.hit_score_focused = True
-        args.sweep_mode = False
-        args.focus_last_n = 10
-        args.multi_restarts = 5
-        args.gpu_preallocate = True
-        args.gpu_batch_size = 320
-        args.diffusion_batch_size = 128
-        args.tune_trials = 12
-        args.tune_epochs = 10
-        args.final_epochs = 64
-        args.backtest_folds = 10
-        args.backtest_epochs = 20
-        args.blend_random_candidates = 3600
-        args.blend_coordinate_iters = 14
-        args.blend_coordinate_step = 0.42
-        args.blend_simplex_iters = 160
-        args.blend_simplex_step = 0.24
-        args.blend_tail_iters = 8
-        args.blend_tail_candidates = 360
-        args.backtest_local_random_candidates = 2600
-        args.backtest_optimize_avg = True
-        args.diffusion_trials = 1
-        args.diffusion_epochs = 4
-        args.diffusion_steps = 28
-        args.diffusion_samples = 3
-        args.diffusion_future_samples = 64
-        args.diffusion_window = 64
-        args.reward_epochs = 10
-        args.reward_window = 320
-        return
-    raise ValueError(f"Unknown profile: {args.profile}")
-
-
-def configure_hardware(preallocate_gpu: bool = False, gpu_batch_size_override: int = 0) -> Dict[str, object]:
+def configure_hardware(
+    preallocate_gpu: bool = False,
+    gpu_batch_size_override: int = 0,
+    perf_mode: str = "auto",
+) -> Dict[str, object]:
     hw: Dict[str, object] = {
         "gpu_count": 0,
         "gpu_names": [],
@@ -287,7 +286,10 @@ def configure_hardware(preallocate_gpu: bool = False, gpu_batch_size_override: i
     hw["gpu_count"] = len(gpus)
     hw["gpu_names"] = [g.name for g in gpus]
     # In preallocate mode we start with a larger batch to drive higher VRAM occupancy.
-    hw["batch_size"] = 256 if not preallocate_gpu else 512
+    if preallocate_gpu:
+        hw["batch_size"] = 640 if str(perf_mode).lower() == "high" else 512
+    else:
+        hw["batch_size"] = 320 if str(perf_mode).lower() == "high" else 256
     if gpu_batch_size_override > 0:
         hw["batch_size"] = int(gpu_batch_size_override)
 
@@ -1461,7 +1463,7 @@ def one_step_train_val_indices(
     return train_idx, val_idx
 
 
-def build_model(config: ModelConfig, n_features: int, n_aux: int) -> keras.Model:
+def build_model(config: ModelConfig, n_features: int, n_aux: int, steps_per_execution: int = 0) -> keras.Model:
     """
     Hybrid architecture inspired by:
     - PatchTST (patch tokenization + transformer mixing),
@@ -1561,20 +1563,58 @@ def build_model(config: ModelConfig, n_features: int, n_aux: int) -> keras.Model
     metrics["addl"] = [keras.metrics.SparseCategoricalAccuracy(name="acc")]
     metrics["aux"] = [keras.metrics.MeanAbsoluteError(name="mae")]
 
-    model.compile(
+    compile_kwargs = dict(
         optimizer=keras.optimizers.Adam(learning_rate=config.lr, clipnorm=1.0),
         loss=losses,
         loss_weights=loss_weights,
         metrics=metrics,
+        weighted_metrics=[],
     )
+    if int(steps_per_execution) > 0:
+        compile_kwargs["steps_per_execution"] = int(steps_per_execution)
+    model.compile(**compile_kwargs)
     return model
 
 
-def make_dataset(X: np.ndarray, y: Dict[str, np.ndarray], batch_size: int, shuffle: bool) -> tf.data.Dataset:
-    ds = tf.data.Dataset.from_tensor_slices((X, y))
+def make_dataset(
+    X: np.ndarray,
+    y: Dict[str, np.ndarray],
+    batch_size: int,
+    shuffle: bool,
+    cache: bool = False,
+    sample_weights: np.ndarray | None = None,
+) -> tf.data.Dataset:
+    if sample_weights is None:
+        ds = tf.data.Dataset.from_tensor_slices((X, y))
+    else:
+        w = np.asarray(sample_weights, dtype=np.float32).reshape(-1)
+        if len(w) != len(X):
+            w = np.ones(len(X), dtype=np.float32)
+        w_dict = {k: w for k in y.keys()}
+        ds = tf.data.Dataset.from_tensor_slices((X, y, w_dict))
+    if cache:
+        ds = ds.cache()
     if shuffle:
-        ds = ds.shuffle(len(X), seed=SEED, reshuffle_each_iteration=True)
+        ds = ds.shuffle(len(X), seed=ACTIVE_SEED, reshuffle_each_iteration=True)
+    opts = tf.data.Options()
+    opts.experimental_deterministic = False
+    ds = ds.with_options(opts)
     return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+
+def predict_outputs_dict(model: keras.Model, x: np.ndarray) -> Dict[str, np.ndarray]:
+    """
+    Fast inference path that avoids repeated Keras predict-function retracing.
+    """
+    out = model(x, training=False)
+    if isinstance(out, dict):
+        return {k: np.asarray(v) for k, v in out.items()}
+    if isinstance(out, (list, tuple)):
+        names = list(model.output_names)
+        return {names[i]: np.asarray(v) for i, v in enumerate(out)}
+    names = list(model.output_names)
+    key = names[0] if names else "output_0"
+    return {key: np.asarray(out)}
 
 
 def scale_fold_data(
@@ -1616,6 +1656,10 @@ def run_single_fit(
     val_idx: np.ndarray,
     epochs: int,
     batch_size: int,
+    steps_per_execution: int = 0,
+    cache_dataset: bool = False,
+    train_sample_weights: np.ndarray | None = None,
+    val_sample_weights: np.ndarray | None = None,
     verbose: int = 0,
 ) -> Tuple[keras.Model, keras.callbacks.History, Dict[str, float], StandardScaler]:
     X_train, y_train, X_val, y_val, scaler_x = scale_fold_data(X_seq, y_raw, train_idx, val_idx)
@@ -1624,13 +1668,32 @@ def run_single_fit(
 
     while cur_batch >= 8:
         tf.keras.backend.clear_session()
-        model = build_model(config, n_features=X_seq.shape[-1], n_aux=y_raw["aux"].shape[-1])
+        model = build_model(
+            config,
+            n_features=X_seq.shape[-1],
+            n_aux=y_raw["aux"].shape[-1],
+            steps_per_execution=steps_per_execution,
+        )
         callbacks = [
             keras.callbacks.EarlyStopping(monitor="val_loss", patience=5, restore_best_weights=True, verbose=0),
             keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3, min_lr=1e-5, verbose=0),
         ]
-        train_ds = make_dataset(X_train, y_train, batch_size=cur_batch, shuffle=True)
-        val_ds = make_dataset(X_val, y_val, batch_size=cur_batch, shuffle=False)
+        train_ds = make_dataset(
+            X_train,
+            y_train,
+            batch_size=cur_batch,
+            shuffle=True,
+            cache=cache_dataset,
+            sample_weights=train_sample_weights,
+        )
+        val_ds = make_dataset(
+            X_val,
+            y_val,
+            batch_size=cur_batch,
+            shuffle=False,
+            cache=cache_dataset,
+            sample_weights=val_sample_weights,
+        )
         try:
             history = model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=verbose)
             val_metrics = model.evaluate(val_ds, return_dict=True, verbose=0)
@@ -1864,6 +1927,20 @@ def recency_weights_for_target_rows(df: pd.DataFrame, target_row_ids: np.ndarray
     return recency_weights_from_draw_date(draw_vals, date_vals, order_vals)
 
 
+def sharpen_recency_weights(weights: np.ndarray, power: float = 1.35, floor: float = 0.32) -> np.ndarray:
+    """
+    Raise recency contrast for training sample weighting while keeping stability.
+    """
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if len(w) == 0:
+        return w.astype(np.float32)
+    w = np.clip(w, 1e-8, None)
+    w = np.power(w, max(1.0, float(power)))
+    w = w / (float(np.mean(w)) + 1e-12)
+    w = np.clip(w, float(floor), 4.5)
+    return w.astype(np.float32)
+
+
 def evaluate_hit_score(
     model: keras.Model,
     scaler_x: StandardScaler,
@@ -1893,7 +1970,7 @@ def evaluate_hit_score(
         X_eval = scaler_x.transform(X_seq[eval_idx].reshape(-1, n_features)).reshape(
             len(eval_idx), X_seq.shape[1], n_features
         ).astype(np.float32)
-        preds = model.predict(X_eval, verbose=0)
+        preds = predict_outputs_dict(model, X_eval)
     else:
         preds = cached_preds
 
@@ -2027,7 +2104,7 @@ def reward_guided_refinement(
         else:
             y_reward[key] = arr[reward_idx].astype(np.int32)
 
-    preds = model.predict(X_reward, verbose=0, batch_size=max(16, min(batch_size, len(X_reward))))
+    preds = predict_outputs_dict(model, X_reward)
     win_hits: List[int] = []
     addl_hits: List[int] = []
     conf_scores: List[float] = []
@@ -2144,6 +2221,8 @@ def reward_guided_refinement(
 
 
 def generate_trial_configs(num_trials: int) -> List[ModelConfig]:
+    # Anchor from best observed run: log_01_s42_A (avg_win_hits=1.7000).
+    anchor = ModelConfig(seq_len=24, lstm_units=128, gru_units=64, dense_units=160, dropout=0.2, lr=3e-4)
     seq_lens = [18, 24, 30, 36]
     lstm_units = [96, 128]
     gru_units = [64, 96]
@@ -2163,7 +2242,22 @@ def generate_trial_configs(num_trials: int) -> List[ModelConfig]:
         for s, lstm, gru, dense, drop, lr in itertools.product(seq_lens, lstm_units, gru_units, dense_units, dropouts, lrs)
     ]
     random.shuffle(all_configs)
-    return all_configs[: max(1, num_trials)]
+    target_n = max(1, int(num_trials))
+    out: List[ModelConfig] = [anchor]
+    for cfg in all_configs:
+        if len(out) >= target_n:
+            break
+        if (
+            cfg.seq_len == anchor.seq_len
+            and cfg.lstm_units == anchor.lstm_units
+            and cfg.gru_units == anchor.gru_units
+            and cfg.dense_units == anchor.dense_units
+            and abs(cfg.dropout - anchor.dropout) < 1e-12
+            and abs(cfg.lr - anchor.lr) < 1e-12
+        ):
+            continue
+        out.append(cfg)
+    return out
 
 
 def generate_blend_candidates(base: Dict[str, float]) -> List[Dict[str, float]]:
@@ -2608,6 +2702,9 @@ def run_tuning(
     focus_last_n: int,
     batch_size: int,
     hit_score_focused: bool = False,
+    steps_per_execution: int = 0,
+    cache_dataset: bool = False,
+    train_recency_weighted: bool = False,
 ) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
     for trial_idx, cfg in enumerate(trial_configs, start=1):
@@ -2639,6 +2736,16 @@ def run_tuning(
                 train_idx, val_idx = one_step_train_val_indices(seq_anchor, min_train_core=min_train)
                 if len(train_idx) == 0 or len(val_idx) == 0:
                     continue
+                if bool(train_recency_weighted):
+                    train_sw = sharpen_recency_weights(
+                        recency_weights_for_target_rows(df, target_rows[np.asarray(train_idx, dtype=np.int32)]),
+                        power=1.35,
+                        floor=0.32,
+                    )
+                    val_sw = recency_weights_for_target_rows(df, target_rows[np.asarray(val_idx, dtype=np.int32)])
+                else:
+                    train_sw = None
+                    val_sw = None
                 model, history, _, scaler_x = run_single_fit(
                     config=cfg,
                     X_seq=X_seq,
@@ -2647,6 +2754,10 @@ def run_tuning(
                     val_idx=val_idx,
                     epochs=tune_epochs,
                     batch_size=batch_size,
+                    steps_per_execution=steps_per_execution,
+                    cache_dataset=cache_dataset,
+                    train_sample_weights=train_sw,
+                    val_sample_weights=val_sw,
                     verbose=0,
                 )
                 best_fold_val = float(np.min(history.history.get("val_loss", [math.inf])))
@@ -2684,6 +2795,8 @@ def run_tuning(
                     val_idx=val_idx,
                     epochs=tune_epochs,
                     batch_size=batch_size,
+                    steps_per_execution=steps_per_execution,
+                    cache_dataset=cache_dataset,
                     verbose=0,
                 )
                 best_fold_val = float(np.min(history.history.get("val_loss", [math.inf])))
@@ -2914,6 +3027,11 @@ def run_backtest(
     batch_size: int,
     local_random_candidates: int,
     optimize_avg: bool,
+    backtest_restarts: int = 1,
+    restart_ensemble_topk: int = 1,
+    steps_per_execution: int = 0,
+    cache_dataset: bool = False,
+    train_recency_weighted: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     n_samples = len(X_seq)
     records: List[Dict[str, object]] = []
@@ -2925,21 +3043,71 @@ def run_backtest(
             train_idx, val_idx = one_step_train_val_indices(int(seq_i), min_train_core=max(120, config.seq_len * 4))
             if len(train_idx) == 0 or len(val_idx) == 0:
                 continue
-
-            model, _, _, scaler_x = run_single_fit(
-                config=config,
-                X_seq=X_seq,
-                y_raw=y_raw,
-                train_idx=train_idx,
-                val_idx=val_idx,
-                epochs=backtest_epochs,
-                batch_size=batch_size,
-                verbose=0,
-            )
             n_features = X_seq.shape[-1]
-            X_test = scaler_x.transform(X_seq[[seq_i]].reshape(-1, n_features)).reshape(1, X_seq.shape[1], n_features).astype(np.float32)
-            pred_one = model.predict(X_test, verbose=0)
-            pred_pack = {k: v[0:1] for k, v in pred_one.items()}
+            n_restart = int(max(1, backtest_restarts))
+            top_k = int(max(1, min(restart_ensemble_topk, n_restart)))
+            restart_pool: List[Tuple[float, Dict[str, np.ndarray]]] = []
+            if bool(train_recency_weighted):
+                val_sw = recency_weights_for_target_rows(df, target_rows[np.asarray(val_idx, dtype=np.int32)])
+            else:
+                val_sw = None
+
+            for restart_i in range(n_restart):
+                restart_seed = int(ACTIVE_SEED + 97 * restart_i + 13 * pos)
+                set_global_seed(restart_seed)
+                if bool(train_recency_weighted):
+                    train_sw = sharpen_recency_weights(
+                        recency_weights_for_target_rows(df, target_rows[np.asarray(train_idx, dtype=np.int32)]),
+                        power=1.35,
+                        floor=0.32,
+                    )
+                else:
+                    train_sw = None
+                model, _, _, scaler_x = run_single_fit(
+                    config=config,
+                    X_seq=X_seq,
+                    y_raw=y_raw,
+                    train_idx=train_idx,
+                    val_idx=val_idx,
+                    epochs=backtest_epochs,
+                    batch_size=batch_size,
+                    steps_per_execution=steps_per_execution,
+                    cache_dataset=cache_dataset,
+                    train_sample_weights=train_sw,
+                    val_sample_weights=val_sw,
+                    verbose=0,
+                )
+                X_test = scaler_x.transform(X_seq[[seq_i]].reshape(-1, n_features)).reshape(
+                    1, X_seq.shape[1], n_features
+                ).astype(np.float32)
+                pred_one = predict_outputs_dict(model, X_test)
+                val_metrics = evaluate_hit_score(
+                    model=model,
+                    scaler_x=scaler_x,
+                    X_seq=X_seq,
+                    eval_idx=np.asarray(val_idx, dtype=np.int32),
+                    target_rows=target_rows,
+                    df=df,
+                    win_cluster_prior_matrix=win_cluster_prior_matrix,
+                    addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+                    repel_prior_matrix=repel_prior_matrix,
+                    weights=blend_weights,
+                    sample_weights=val_sw,
+                )
+                restart_score = float(
+                    3.2 * val_metrics["avg_win_hits"]
+                    + 2.8 * val_metrics["p_hit_ge3"]
+                    + 7.2 * val_metrics["p_hit_ge4"]
+                    + 0.3 * val_metrics["p_hit_ge2"]
+                )
+                restart_pool.append((restart_score, pred_one))
+
+            restart_pool.sort(key=lambda x: x[0], reverse=True)
+            chosen = restart_pool[:top_k]
+            pred_pack = {
+                k: np.mean(np.stack([p[k] for _, p in chosen], axis=0), axis=0)
+                for k in chosen[0][1].keys()
+            }
             target_row = int(target_rows[seq_i])
 
             hist_labels = cluster_labels[:target_row]
@@ -3071,12 +3239,14 @@ def run_backtest(
                 val_idx=val_idx,
                 epochs=backtest_epochs,
                 batch_size=batch_size,
+                steps_per_execution=steps_per_execution,
+                cache_dataset=cache_dataset,
                 verbose=0,
             )
 
             n_features = X_seq.shape[-1]
             X_test = scaler_x.transform(X_seq[test_idx].reshape(-1, n_features)).reshape(len(test_idx), X_seq.shape[1], n_features).astype(np.float32)
-            preds = model.predict(X_test, verbose=0)
+            preds = predict_outputs_dict(model, X_test)
 
             for local_i, seq_i in enumerate(test_idx):
                 pred_pack = {k: v[local_i : local_i + 1] for k, v in preds.items()}
@@ -3840,10 +4010,8 @@ def build_single_html_report(
 
 def main() -> None:
     args = parse_args()
-    apply_named_profile(args)
     set_global_seed(int(args.seed))
-    profile_locked = str(getattr(args, "profile", "") or "").strip().lower() == "s42_a_prod"
-    if bool(args.hit_score_focused) and not profile_locked:
+    if bool(args.hit_score_focused):
         prev_focus = int(args.focus_last_n)
         args.focus_last_n = 10 if int(args.focus_last_n) <= 0 else max(int(args.focus_last_n), 10)
         if bool(args.sweep_mode):
@@ -3863,6 +4031,10 @@ def main() -> None:
             args.blend_tail_iters = max(int(args.blend_tail_iters), 4)
             args.blend_tail_candidates = max(int(args.blend_tail_candidates), 160)
             args.backtest_local_random_candidates = max(int(args.backtest_local_random_candidates), 900)
+            args.backtest_restarts = max(int(args.backtest_restarts), 1)
+            args.restart_ensemble_topk = max(1, min(int(args.restart_ensemble_topk), int(args.backtest_restarts)))
+            args.steps_per_execution = max(int(args.steps_per_execution), 24)
+            args.dataset_cache = bool(args.dataset_cache) or bool(args.gpu_preallocate)
             args.diffusion_trials = max(1, int(args.diffusion_trials))
             args.diffusion_epochs = max(4, int(args.diffusion_epochs))
             args.diffusion_steps = max(28, int(args.diffusion_steps))
@@ -3872,20 +4044,26 @@ def main() -> None:
         else:
             args.tune_trials = max(int(args.tune_trials), 14)
             args.tune_epochs = max(int(args.tune_epochs), 10)
-            args.multi_restarts = max(int(args.multi_restarts), 2)
-            args.final_epochs = max(int(args.final_epochs), 72)
+            args.multi_restarts = max(int(args.multi_restarts), 5)
+            args.final_epochs = max(int(args.final_epochs), 64)
             args.backtest_folds = max(int(args.backtest_folds), 10)
             args.backtest_epochs = max(int(args.backtest_epochs), 20)
-            args.reward_epochs = max(int(args.reward_epochs), 8)
-            args.reward_window = max(int(args.reward_window), 300)
-            args.blend_random_candidates = max(int(args.blend_random_candidates), 2600)
-            args.blend_coordinate_iters = max(int(args.blend_coordinate_iters), 10)
-            args.blend_coordinate_step = max(float(args.blend_coordinate_step), 0.38)
-            args.blend_simplex_iters = max(int(args.blend_simplex_iters), 84)
-            args.blend_simplex_step = max(float(args.blend_simplex_step), 0.22)
-            args.blend_tail_iters = max(int(args.blend_tail_iters), 6)
-            args.blend_tail_candidates = max(int(args.blend_tail_candidates), 240)
-            args.backtest_local_random_candidates = max(int(args.backtest_local_random_candidates), 1800)
+            args.reward_epochs = max(int(args.reward_epochs), 10)
+            args.reward_window = max(int(args.reward_window), 320)
+            args.blend_random_candidates = max(int(args.blend_random_candidates), 3600)
+            args.blend_coordinate_iters = max(int(args.blend_coordinate_iters), 14)
+            args.blend_coordinate_step = max(float(args.blend_coordinate_step), 0.42)
+            args.blend_simplex_iters = max(int(args.blend_simplex_iters), 160)
+            args.blend_simplex_step = max(float(args.blend_simplex_step), 0.24)
+            args.blend_tail_iters = max(int(args.blend_tail_iters), 8)
+            args.blend_tail_candidates = max(int(args.blend_tail_candidates), 360)
+            args.backtest_local_random_candidates = max(int(args.backtest_local_random_candidates), 2600)
+            args.backtest_restarts = max(int(args.backtest_restarts), 1)
+            args.restart_ensemble_topk = max(1, min(int(args.restart_ensemble_topk), int(args.backtest_restarts)))
+            args.steps_per_execution = max(int(args.steps_per_execution), 32)
+            args.dataset_cache = bool(args.dataset_cache) or bool(args.gpu_preallocate)
+            if str(args.perf_mode).lower() == "auto":
+                args.perf_mode = "high"
             args.diffusion_trials = max(int(args.diffusion_trials), 5)
             args.diffusion_epochs = max(int(args.diffusion_epochs), 14)
             args.diffusion_steps = max(int(args.diffusion_steps), 72)
@@ -3901,13 +4079,11 @@ def main() -> None:
             f"coord_iters={args.blend_coordinate_iters}, coord_step={args.blend_coordinate_step:.2f}, "
             f"simplex_iters={args.blend_simplex_iters}, simplex_step={args.blend_simplex_step:.2f}, "
             f"tail_iters={args.blend_tail_iters}, tail_cands={args.blend_tail_candidates}, "
-            f"bt_local_random={args.backtest_local_random_candidates}, bt_opt_avg={'Y' if args.backtest_optimize_avg else 'N'}, "
+            f"bt_local_random={args.backtest_local_random_candidates}, bt_restarts={args.backtest_restarts}, "
+            f"bt_topk={args.restart_ensemble_topk}, bt_opt_avg={'Y' if args.backtest_optimize_avg else 'N'}, "
+            f"train_recent_w={'Y' if args.train_recency_weighted else 'N'}, "
+            f"steps_per_exec={args.steps_per_execution}, cache={'Y' if args.dataset_cache else 'N'}, perf={args.perf_mode}, "
             f"diff_trials={args.diffusion_trials}, diff_epochs={args.diffusion_epochs}, diff_steps={args.diffusion_steps}"
-        )
-    elif bool(args.hit_score_focused) and profile_locked:
-        print(
-            "[HIT-FOCUS] profile-locked mode: "
-            f"using frozen profile parameters for {args.profile}."
         )
     csv_path = Path(args.csv)
     if not csv_path.exists():
@@ -3922,13 +4098,15 @@ def main() -> None:
     print("=" * 90)
     print("ToTo Tuned Cluster DL + Single HTML Report")
     print("=" * 90)
-    if str(args.profile).strip():
-        print(f"Profile: {args.profile}")
     print(f"Seed: {args.seed}")
     print(f"Input CSV: {csv_path}")
     print(f"Output HTML: {html_path}")
 
-    hw = configure_hardware(preallocate_gpu=bool(args.gpu_preallocate), gpu_batch_size_override=int(args.gpu_batch_size))
+    hw = configure_hardware(
+        preallocate_gpu=bool(args.gpu_preallocate),
+        gpu_batch_size_override=int(args.gpu_batch_size),
+        perf_mode=str(args.perf_mode),
+    )
     print(f"Hardware: GPUs={hw['gpu_count']} names={hw['gpu_names']} mixed_precision={hw['mixed_precision']} xla={hw['xla']}")
 
     df_raw = pd.read_csv(csv_path)
@@ -4026,6 +4204,9 @@ def main() -> None:
         focus_last_n=args.focus_last_n,
         batch_size=int(hw["batch_size"]),
         hit_score_focused=bool(args.hit_score_focused),
+        steps_per_execution=int(args.steps_per_execution),
+        cache_dataset=bool(args.dataset_cache),
+        train_recency_weighted=bool(args.train_recency_weighted),
     )
     best_row = tuning_df.iloc[0]
     best_config = ModelConfig(
@@ -4046,9 +4227,21 @@ def main() -> None:
         if len(restart_eval_idx) == 0:
             restart_eval_idx = val_idx
         restart_eval_weights = recency_weights_for_target_rows(df, target_rows[np.asarray(restart_eval_idx, dtype=np.int32)])
+        if bool(args.train_recency_weighted):
+            final_train_sw = sharpen_recency_weights(
+                recency_weights_for_target_rows(df, target_rows[np.asarray(train_idx, dtype=np.int32)]),
+                power=1.35,
+                floor=0.32,
+            )
+            final_val_sw = recency_weights_for_target_rows(df, target_rows[np.asarray(val_idx, dtype=np.int32)])
+        else:
+            final_train_sw = None
+            final_val_sw = None
     else:
         restart_eval_idx = val_idx
         restart_eval_weights = None
+        final_train_sw = None
+        final_val_sw = None
 
     n_restarts = max(1, int(args.multi_restarts))
     best_restart_score = -1e18
@@ -4077,6 +4270,10 @@ def main() -> None:
             val_idx=val_idx,
             epochs=args.final_epochs,
             batch_size=int(hw["batch_size"]),
+            steps_per_execution=int(args.steps_per_execution),
+            cache_dataset=bool(args.dataset_cache),
+            train_sample_weights=final_train_sw,
+            val_sample_weights=final_val_sw,
             verbose=0,
         )
         restart_metrics = evaluate_hit_score(
@@ -4115,7 +4312,12 @@ def main() -> None:
         raise RuntimeError("Final training restarts failed to produce a model.")
 
     tf.keras.backend.clear_session()
-    model = build_model(best_config, n_features=X_seq.shape[-1], n_aux=y_raw["aux"].shape[-1])
+    model = build_model(
+        best_config,
+        n_features=X_seq.shape[-1],
+        n_aux=y_raw["aux"].shape[-1],
+        steps_per_execution=int(args.steps_per_execution),
+    )
     model.set_weights(best_weights)
     scaler_x = best_scaler_x
     final_history = keras.callbacks.History()
@@ -4172,7 +4374,13 @@ def main() -> None:
             y_test[key] = arr[test_idx].astype(np.float32)
         else:
             y_test[key] = arr[test_idx].astype(np.int32)
-    test_ds = make_dataset(X_test, y_test, batch_size=int(hw["batch_size"]), shuffle=False)
+    test_ds = make_dataset(
+        X_test,
+        y_test,
+        batch_size=int(hw["batch_size"]),
+        shuffle=False,
+        cache=bool(args.dataset_cache),
+    )
     final_test_metrics = model.evaluate(test_ds, return_dict=True, verbose=0)
 
     # Blend-weight calibration and selection on validation slice.
@@ -4199,11 +4407,7 @@ def main() -> None:
         X_blend_eval = scaler_x.transform(X_seq[blend_eval_idx].reshape(-1, n_features)).reshape(
             len(blend_eval_idx), X_seq.shape[1], n_features
         ).astype(np.float32)
-        blend_eval_preds = model.predict(
-            X_blend_eval,
-            verbose=0,
-            batch_size=max(16, min(int(hw["batch_size"]), len(blend_eval_idx))),
-        )
+        blend_eval_preds = predict_outputs_dict(model, X_blend_eval)
 
     calibrated_blend, blend_component_df = calibrate_blend_weights_by_component_performance(
         model=model,
@@ -4317,6 +4521,11 @@ def main() -> None:
         batch_size=int(hw["batch_size"]),
         local_random_candidates=int(args.backtest_local_random_candidates),
         optimize_avg=bool(args.backtest_optimize_avg),
+        backtest_restarts=int(args.backtest_restarts),
+        restart_ensemble_topk=int(args.restart_ensemble_topk),
+        steps_per_execution=int(args.steps_per_execution),
+        cache_dataset=bool(args.dataset_cache),
+        train_recency_weighted=bool(args.train_recency_weighted),
     )
 
     # Final prediction for next draw using latest sequence + cluster trend priors.
@@ -4340,7 +4549,7 @@ def main() -> None:
     repel_next_prior = build_repel_system(next_df)["repel_prior"][-1]
 
     latest_seq = scaler_x.transform(X_seq[-1].reshape(-1, n_features)).reshape(1, X_seq.shape[1], n_features).astype(np.float32)
-    pred_latest = model.predict(latest_seq, verbose=0)
+    pred_latest = predict_outputs_dict(model, latest_seq)
     pred_win, pred_addl = combine_prediction(
         pred=pred_latest,
         win_cluster_prior=win_cluster_next_prior,

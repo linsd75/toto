@@ -32,6 +32,10 @@ class AvgConfig:
     reward_epochs: int
     reward_window: int
     focus_last_n: int
+    gpu_batch_size: int
+    backtest_restarts: int
+    restart_topk: int
+    train_recency_weighted: bool
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,32 +102,29 @@ def objective(row: Dict[str, float]) -> float:
 
 
 def build_configs() -> List[AvgConfig]:
-    # Anchors from user-provided report families.
-    # report_01_s42_A.html
-    a = AvgConfig("s42_A_base", 42, 5, 8, 360, 160, 0.24, 3600, 2600, 64, 20, 12, 10, 14, 0.42, 10, 320, 10)
-    # report_06_s236_B.html
-    b = AvgConfig("s236_B_base", 236, 6, 10, 520, 220, 0.28, 5200, 4200, 80, 24, 14, 12, 14, 0.42, 10, 320, 10)
-    # report_02_s42_r4_t8c300_s120.html
-    c = AvgConfig("s42_r4_t8c300_s120_base", 42, 4, 8, 300, 120, 0.24, 2200, 2200, 42, 12, 8, 8, 8, 0.34, 6, 220, 10)
-    # report_04_s139_r4_t8c300_s120.html
-    d = AvgConfig("s139_r4_t8c300_s120_base", 139, 4, 8, 300, 120, 0.24, 2200, 2200, 42, 12, 8, 8, 8, 0.34, 6, 220, 10)
-    # report_05_s236_r3_t6c200_s96.html
-    e = AvgConfig("s236_r3_t6c200_s96_base", 236, 3, 6, 200, 96, 0.20, 1700, 1700, 42, 12, 8, 8, 8, 0.34, 6, 220, 10)
-
-    cfgs: List[AvgConfig] = [a, b, c, d, e]
-
-    # Aggressive local variants for avg-hit push.
-    cfgs.extend(
-        [
-            AvgConfig("s42_A_v1", 42, 6, 10, 520, 220, 0.28, 5200, 4200, 80, 24, 14, 12, 16, 0.48, 12, 398, 12),
-            AvgConfig("s42_A_v2", 42, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12),
-            AvgConfig("s236_B_v1", 236, 7, 12, 680, 280, 0.30, 7200, 6200, 96, 28, 18, 13, 18, 0.50, 13, 420, 12),
-            AvgConfig("s236_B_v2", 236, 8, 12, 760, 320, 0.32, 8200, 7200, 108, 30, 20, 14, 20, 0.54, 14, 460, 12),
-            AvgConfig("s42_r4_v1", 42, 5, 8, 360, 160, 0.24, 3600, 2800, 64, 18, 12, 10, 14, 0.42, 10, 300, 10),
-            AvgConfig("s139_r4_v1", 139, 5, 8, 360, 160, 0.24, 3600, 2800, 64, 18, 12, 10, 14, 0.42, 10, 300, 10),
-            AvgConfig("s236_r3_v1", 236, 4, 8, 300, 120, 0.24, 2800, 2400, 56, 16, 10, 9, 12, 0.40, 8, 260, 10),
-        ]
-    )
+    """
+    16-run aggressive grid around the two strongest families:
+    - report_01_s42_A
+    - report_07_s42_A_v2
+    """
+    cfgs: List[AvgConfig] = [
+        AvgConfig("s42_A_g1", 42, 5, 8, 360, 160, 0.24, 3600, 2600, 64, 20, 12, 10, 14, 0.42, 10, 320, 10, 320, 1, 1, False),
+        AvgConfig("s42_A_g2", 42, 5, 8, 360, 200, 0.24, 4200, 3200, 72, 20, 14, 10, 14, 0.42, 10, 320, 10, 320, 1, 1, False),
+        AvgConfig("s42_A_g3", 42, 6, 8, 420, 200, 0.26, 4600, 3600, 72, 22, 14, 10, 16, 0.44, 10, 340, 10, 352, 1, 1, False),
+        AvgConfig("s42_A_g4", 42, 6, 10, 520, 220, 0.28, 5200, 4200, 80, 24, 14, 12, 16, 0.48, 12, 398, 12, 352, 1, 1, True),
+        AvgConfig("s42_A_g5", 42, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12, 384, 1, 1, True),
+        AvgConfig("s42_A_g6", 42, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12, 384, 2, 1, True),
+        AvgConfig("s42_A_g7", 42, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12, 384, 2, 2, True),
+        AvgConfig("s42_A_g8", 42, 8, 12, 760, 320, 0.32, 7200, 6200, 104, 28, 18, 13, 20, 0.54, 14, 460, 12, 416, 2, 2, True),
+        AvgConfig("s139_A_g1", 139, 5, 8, 360, 160, 0.24, 3600, 2600, 64, 20, 12, 10, 14, 0.42, 10, 320, 10, 320, 1, 1, False),
+        AvgConfig("s139_A_g2", 139, 5, 8, 360, 200, 0.24, 4200, 3200, 72, 20, 14, 10, 14, 0.42, 10, 320, 10, 320, 1, 1, False),
+        AvgConfig("s139_A_g3", 139, 6, 8, 420, 200, 0.26, 4600, 3600, 72, 22, 14, 10, 16, 0.44, 10, 340, 10, 352, 1, 1, False),
+        AvgConfig("s139_A_g4", 139, 6, 10, 520, 220, 0.28, 5200, 4200, 80, 24, 14, 12, 16, 0.48, 12, 398, 12, 352, 1, 1, True),
+        AvgConfig("s139_A_g5", 139, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12, 384, 1, 1, True),
+        AvgConfig("s236_A_g1", 236, 6, 10, 520, 220, 0.28, 5200, 4200, 80, 24, 14, 12, 16, 0.48, 12, 398, 12, 352, 1, 1, True),
+        AvgConfig("s236_A_g2", 236, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12, 384, 2, 1, True),
+        AvgConfig("s333_A_g1", 333, 7, 10, 640, 260, 0.30, 6200, 5200, 92, 26, 16, 12, 18, 0.50, 13, 420, 12, 384, 2, 2, True),
+    ]
     return cfgs
 
 
@@ -153,9 +154,14 @@ def run_one(
         str(cfg.multi_restarts),
         "--gpu-preallocate",
         "--gpu-batch-size",
-        "320",
+        str(cfg.gpu_batch_size),
         "--diffusion-batch-size",
         "128",
+        "--perf-mode",
+        "high",
+        "--steps-per-execution",
+        "32",
+        "--dataset-cache",
         "--tune-trials",
         str(cfg.tune_trials),
         "--tune-epochs",
@@ -182,6 +188,10 @@ def run_one(
         str(cfg.tail_cands),
         "--backtest-local-random-candidates",
         str(cfg.local_random),
+        "--backtest-restarts",
+        str(cfg.backtest_restarts),
+        "--restart-ensemble-topk",
+        str(cfg.restart_topk),
         "--diffusion-trials",
         "1",
         "--diffusion-epochs",
@@ -201,6 +211,8 @@ def run_one(
         "--output-html",
         html_rel,
     ]
+    if cfg.train_recency_weighted:
+        cmd.append("--train-recency-weighted")
     print(f"[{idx}] {cfg.name} ...", flush=True)
     proc = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True, encoding="utf-8", errors="replace")
     log_path = out_dir / f"log_{idx:02d}_{cfg.name}.txt"
@@ -231,6 +243,10 @@ def run_one(
         "reward_epochs": float(cfg.reward_epochs),
         "reward_window": float(cfg.reward_window),
         "focus_last_n": float(cfg.focus_last_n),
+        "gpu_batch_size": float(cfg.gpu_batch_size),
+        "backtest_restarts": float(cfg.backtest_restarts),
+        "restart_topk": float(cfg.restart_topk),
+        "train_recency_weighted": float(1 if cfg.train_recency_weighted else 0),
     }
     for k in [
         "avg_win_hits",
@@ -312,13 +328,7 @@ def main() -> None:
         "best": best,
         "runs_requested": len(configs),
         "runs_completed": len(rows),
-        "base_families": [
-            "report_01_s42_A",
-            "report_06_s236_B",
-            "report_02_s42_r4_t8c300_s120",
-            "report_04_s139_r4_t8c300_s120",
-            "report_05_s236_r3_t6c200_s96",
-        ],
+        "search_mode": "16-run aggressive grid around report_01/report_07 families",
         "configs": [asdict(c) for c in configs],
     }
     out_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
