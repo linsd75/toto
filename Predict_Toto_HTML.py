@@ -107,13 +107,28 @@ BLEND_WEIGHTS = {
     "model_soft": 0.9586,
     "model_set": 0.3586,
     "cluster": 0.4802,
+    "graph": 0.4024,
     "repel": 0.1677,
     "addl_model": 0.3917,
     "addl_cluster": 0.3867,
 }
 
-WIN_BLEND_KEYS = ["model_soft", "model_set", "cluster"]
+WIN_BLEND_KEYS = ["model_soft", "model_set", "cluster", "graph"]
 ADDL_BLEND_KEYS = ["addl_model", "addl_cluster"]
+
+SET_RERANK_FEATURE_NAMES = [
+    "mean_log_p",
+    "min_log_p",
+    "mean_log_cluster",
+    "mean_log_repel",
+    "span_norm",
+    "mean_gap_norm",
+    "gap_std_norm",
+    "odd_balance",
+    "low_balance",
+    "top_overlap",
+    "model_conf",
+]
 
 DEFAULT_FEATURE_GROUP_WEIGHTS = {
     "primary": 4.0,
@@ -140,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=SEED, help="Global random seed")
     parser.add_argument("--sweep-mode", action="store_true", help="Use lighter settings for automated multi-run sweeps")
-    parser.add_argument("--csv", default="ToTo-05_Mar_2026.csv", help="Input CSV file path")
+    parser.add_argument("--csv", default="ToTo-09_Mar_2026.csv", help="Input CSV file path")
     parser.add_argument("--clusters", type=int, default=0, help="Force KMeans clusters (0=auto)")
     parser.add_argument("--tune-trials", type=int, default=14, help="Random trials sampled from config space")
     parser.add_argument("--tune-folds", type=int, default=3, help="Walk-forward folds per tuning trial")
@@ -212,6 +227,27 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Optimize strict walk-forward local blend for avg_win_hits emphasis",
+    )
+    parser.add_argument(
+        "--set-rerank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Train a second-stage candidate-set reranker to improve avg_win_hits and tail-hit rates",
+    )
+    parser.add_argument("--set-rerank-window", type=int, default=220, help="Recent sequence samples used to fit set reranker")
+    parser.add_argument("--set-rerank-candidates", type=int, default=96, help="Candidate sets generated per sample for reranking")
+    parser.add_argument("--set-rerank-random", type=int, default=24, help="Stochastic candidates mixed into rerank pool")
+    parser.add_argument("--set-rerank-min-samples", type=int, default=72, help="Minimum samples required to fit set reranker")
+    parser.add_argument("--set-rerank-l2", type=float, default=0.45, help="L2 regularization for set reranker ridge fit")
+    parser.add_argument("--set-rerank-rl-epochs", type=int, default=8, help="Policy-gradient style reward-learning epochs for set reranker")
+    parser.add_argument("--set-rerank-rl-lr", type=float, default=0.018, help="Learning rate for policy-gradient reranker refinement")
+    parser.add_argument("--set-rerank-hardneg-epochs", type=int, default=4, help="Hard-negative contrastive epochs for set reranker")
+    parser.add_argument("--set-rerank-hardneg-lr", type=float, default=0.055, help="Learning rate for hard-negative contrastive refinement")
+    parser.add_argument(
+        "--uncertainty-dynamic-blend",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply entropy/temperature-calibrated dynamic per-draw blend weighting",
     )
     parser.add_argument(
         "--feature-weight-trials",
@@ -953,6 +989,7 @@ def build_feature_pipeline(
         "cluster_profile_means": cluster_profile_means,
         "line_prior_matrix": line_prior_matrix,
         "line_merge_matrix": line_merge_matrix,
+        "graph_prior_matrix": cooc_prior_matrix,
         "repel_prior_matrix": repel_prior_matrix,
         "win_cluster_prior_matrix": win_cluster_prior_matrix,
         "addl_cluster_prior_matrix": addl_cluster_prior_matrix,
@@ -1019,6 +1056,7 @@ def tune_feature_group_weights(
                 target_rows=target_rows,
                 df=pipe["df_features"],
                 win_cluster_prior_matrix=pipe["win_cluster_prior_matrix"],
+                graph_prior_matrix=pipe["graph_prior_matrix"],
                 addl_cluster_prior_matrix=pipe["addl_cluster_prior_matrix"],
                 repel_prior_matrix=pipe["repel_prior_matrix"],
                 weights=BLEND_WEIGHTS,
@@ -1763,6 +1801,23 @@ def normalize_prob(v: np.ndarray) -> np.ndarray:
     return (v / s).astype(np.float64)
 
 
+def normalized_entropy(prob: np.ndarray) -> float:
+    p = normalize_prob(np.asarray(prob, dtype=np.float64))
+    n = max(2, len(p))
+    ent = float(-np.sum(p * np.log(np.clip(p, 1e-12, 1.0))))
+    return float(np.clip(ent / math.log(float(n)), 0.0, 1.0))
+
+
+def temperature_scale_prob(prob: np.ndarray, temperature: float) -> np.ndarray:
+    p = normalize_prob(np.asarray(prob, dtype=np.float64))
+    t = float(np.clip(temperature, 0.55, 2.80))
+    logits = np.log(np.clip(p, 1e-12, 1.0))
+    logits = logits / t
+    logits = logits - float(np.max(logits))
+    ex = np.exp(logits)
+    return normalize_prob(ex)
+
+
 def select_win_numbers_with_repulsion(
     scores: np.ndarray,
     count: int = 6,
@@ -1793,74 +1848,399 @@ def select_win_numbers_with_repulsion(
     return sorted(selected)
 
 
-def combine_prediction(
+def build_combined_distributions(
     pred: Dict[str, np.ndarray],
     win_cluster_prior: np.ndarray,
+    graph_prior: np.ndarray | None,
     addl_cluster_prior: np.ndarray,
     repel_prior: np.ndarray,
     weights: Dict[str, float],
-) -> Tuple[List[int], int]:
-    win_soft = np.mean([pred[f"win_{i}"][0] for i in range(1, 7)], axis=0)
-    win_set = pred["win_set"][0]
-    win_set_prob = normalize_prob(win_set)
-    model_conf = float(np.max(win_set_prob))
-    # High confidence => reduce repulsion and sharpen; low confidence => keep wider spread.
-    repel_scale = 0.46 + 0.84 * (1.0 - model_conf)
+    dynamic_blend: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    win_soft_raw = normalize_prob(np.mean([pred[f"win_{i}"][0] for i in range(1, 7)], axis=0))
+    win_set_raw = normalize_prob(pred["win_set"][0])
+    cluster_raw = normalize_prob(win_cluster_prior)
+    graph_raw = normalize_prob(graph_prior if graph_prior is not None else cluster_raw)
+    repel_raw = normalize_prob(repel_prior)
+    model_conf = float(np.max(win_set_raw))
 
-    # Pruned blend: model + cluster attraction minus repulsion.
+    if dynamic_blend:
+        ent_soft = normalized_entropy(win_soft_raw)
+        ent_set = normalized_entropy(win_set_raw)
+        ent_cluster = normalized_entropy(cluster_raw)
+        ent_graph = normalized_entropy(graph_raw)
+
+        soft_prob = temperature_scale_prob(win_soft_raw, 0.90 + 0.90 * ent_soft)
+        set_prob = temperature_scale_prob(win_set_raw, 0.86 + 1.02 * ent_set)
+        cluster_prob = temperature_scale_prob(cluster_raw, 0.96 + 0.56 * ent_cluster)
+        graph_prob = temperature_scale_prob(graph_raw, 0.94 + 0.66 * ent_graph)
+
+        rel_soft = max(0.08, (1.0 - ent_soft) ** 1.75)
+        rel_set = max(0.08, (1.0 - ent_set) ** 1.95)
+        rel_cluster = max(0.10, (1.0 - ent_cluster) ** 1.28)
+        rel_graph = max(0.10, (1.0 - ent_graph) ** 1.36)
+
+        base_win_weights = {
+            "model_soft": float(weights.get("model_soft", 0.0)),
+            "model_set": float(weights.get("model_set", 0.0)),
+            "cluster": float(weights.get("cluster", 0.0)),
+            "graph": float(weights.get("graph", 0.0)),
+        }
+        win_total = sum(base_win_weights.values()) + 1e-12
+        dyn_win = {
+            "model_soft": base_win_weights["model_soft"] * (0.30 + 0.70 * rel_soft),
+            "model_set": base_win_weights["model_set"] * (0.30 + 0.70 * rel_set),
+            "cluster": base_win_weights["cluster"] * (0.34 + 0.66 * rel_cluster),
+            "graph": base_win_weights["graph"] * (0.34 + 0.66 * rel_graph),
+        }
+        dyn_sum = sum(dyn_win.values()) + 1e-12
+        dyn_win = {k: float(v * (win_total / dyn_sum)) for k, v in dyn_win.items()}
+        avg_unc = 0.5 * (ent_soft + ent_set)
+        repel_scale = 0.34 + 1.08 * avg_unc
+    else:
+        soft_prob = win_soft_raw
+        set_prob = win_set_raw
+        cluster_prob = cluster_raw
+        graph_prob = graph_raw
+        dyn_win = {
+            "model_soft": float(weights.get("model_soft", 0.0)),
+            "model_set": float(weights.get("model_set", 0.0)),
+            "cluster": float(weights.get("cluster", 0.0)),
+            "graph": float(weights.get("graph", 0.0)),
+        }
+        repel_scale = 0.46 + 0.84 * (1.0 - model_conf)
+
     combined_win = (
-        weights["model_soft"] * normalize_prob(win_soft)
-        + weights["model_set"] * win_set_prob
-        + weights["cluster"] * normalize_prob(win_cluster_prior)
-        - (weights["repel"] * repel_scale) * normalize_prob(repel_prior)
+        dyn_win["model_soft"] * soft_prob
+        + dyn_win["model_set"] * set_prob
+        + dyn_win["cluster"] * cluster_prob
+        + dyn_win["graph"] * graph_prob
+        - (float(weights["repel"]) * repel_scale) * repel_raw
     )
     combined_win = normalize_prob(np.clip(combined_win, 1e-12, None))
     sharpen_t = float(np.clip(0.84 + 0.34 * (1.0 - model_conf), 0.70, 1.20))
     combined_win = np.power(np.clip(combined_win, 1e-12, None), 1.0 / sharpen_t)
     combined_win = normalize_prob(combined_win)
-    cluster_prob = normalize_prob(win_cluster_prior)
-
-    plain_top = sorted([int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()])
-    repel_light = select_win_numbers_with_repulsion(combined_win, count=6, p1=0.93, p2=0.97, p3=0.985)
-    repel_std = select_win_numbers_with_repulsion(combined_win, count=6, p1=0.88, p2=0.94, p3=0.97)
-
-    def candidate_utility(nums: List[int]) -> float:
-        idx = np.asarray(nums, dtype=np.int32) - 1
-        p = np.clip(combined_win[idx], 1e-12, 1.0)
-        c = np.clip(cluster_prob[idx], 1e-12, 1.0)
-        # Tail-hit mode prefers concentrated high-probability sets.
-        util = (
-            2.7 * float(np.mean(np.log(p)))
-            + 0.32 * float(np.mean(np.log(c)))
-        )
-        return util
-
-    candidates: Dict[Tuple[int, ...], float] = {}
-    for cand in (plain_top, repel_light, repel_std):
-        key = tuple(sorted(cand))
-        candidates[key] = candidate_utility(list(key))
-    if model_conf >= 0.28:
-        candidates[tuple(plain_top)] += 0.06
-    else:
-        candidates[tuple(repel_light)] += 0.03
-    best_key = max(candidates.items(), key=lambda kv: kv[1])[0]
-    win_numbers = list(best_key)
 
     addl_model = normalize_prob(pred["addl"][0])
+    addl_cluster = normalize_prob(addl_cluster_prior)
+    if dynamic_blend:
+        ent_addl_model = normalized_entropy(addl_model)
+        ent_addl_cluster = normalized_entropy(addl_cluster)
+        addl_model = temperature_scale_prob(addl_model, 0.92 + 0.78 * ent_addl_model)
+        addl_cluster = temperature_scale_prob(addl_cluster, 0.96 + 0.58 * ent_addl_cluster)
+        rel_addl_model = max(0.10, (1.0 - ent_addl_model) ** 1.58)
+        rel_addl_cluster = max(0.10, (1.0 - ent_addl_cluster) ** 1.20)
+        w_addl_model = float(weights["addl_model"]) * (0.30 + 0.70 * rel_addl_model)
+        w_addl_cluster = float(weights["addl_cluster"]) * (0.34 + 0.66 * rel_addl_cluster)
+        addl_norm = (w_addl_model + w_addl_cluster) + 1e-12
+        w_addl_model *= float((weights["addl_model"] + weights["addl_cluster"]) / addl_norm)
+        w_addl_cluster *= float((weights["addl_model"] + weights["addl_cluster"]) / addl_norm)
+    else:
+        w_addl_model = float(weights["addl_model"])
+        w_addl_cluster = float(weights["addl_cluster"])
     combined_addl = (
-        weights["addl_model"] * addl_model
-        + weights["addl_cluster"] * normalize_prob(addl_cluster_prior)
+        w_addl_model * addl_model
+        + w_addl_cluster * addl_cluster
     )
     combined_addl = normalize_prob(np.clip(combined_addl, 1e-12, None))
 
+    cluster_prob = normalize_prob(win_cluster_prior)
+    repel_prob = normalize_prob(repel_prior)
+    return combined_win, combined_addl, cluster_prob, repel_prob, model_conf
+
+
+def choose_addl_from_probs(combined_addl: np.ndarray, win_numbers: List[int]) -> int:
     addl_number = None
+    wins = set(int(x) for x in win_numbers)
     for idx in np.argsort(combined_addl)[::-1]:
         candidate = int(idx + 1)
-        if candidate not in win_numbers:
+        if candidate not in wins:
             addl_number = candidate
             break
     if addl_number is None:
         addl_number = int(np.argmax(combined_addl) + 1)
+    return int(addl_number)
+
+
+def candidate_utility_from_probs(
+    nums: List[int],
+    combined_win: np.ndarray,
+    cluster_prob: np.ndarray,
+) -> float:
+    idx = np.asarray(nums, dtype=np.int32) - 1
+    p = np.clip(combined_win[idx], 1e-12, 1.0)
+    c = np.clip(cluster_prob[idx], 1e-12, 1.0)
+    # Tail-hit mode prefers concentrated high-probability sets.
+    util = 2.7 * float(np.mean(np.log(p))) + 0.32 * float(np.mean(np.log(c)))
+    return float(util)
+
+
+def _candidate_seed_from_probs(combined_win: np.ndarray) -> int:
+    x = np.asarray(combined_win, dtype=np.float64).reshape(-1)
+    mass = int(np.sum(np.floor(np.clip(x, 0.0, 1.0) * 1e6)))
+    mx = int(np.argmax(x)) + 1
+    seed = (ACTIVE_SEED * 65537 + mx * 1543 + mass) & 0xFFFFFFFF
+    return int(seed)
+
+
+def generate_win_set_candidates(
+    combined_win: np.ndarray,
+    max_candidates: int = 96,
+    random_candidates: int = 24,
+) -> List[Tuple[int, ...]]:
+    max_candidates = int(max(16, max_candidates))
+    random_candidates = int(max(0, random_candidates))
+    top_pool = int(np.clip(10 + max_candidates // 10, 10, 24))
+    top_idx = np.argsort(combined_win)[::-1][:top_pool]
+
+    candidates: Dict[Tuple[int, ...], float] = {}
+    plain_top = tuple(sorted([int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()]))
+    candidates[plain_top] = 1.0
+    for p1, p2, p3 in [
+        (0.95, 0.98, 0.99),
+        (0.93, 0.97, 0.985),
+        (0.90, 0.95, 0.98),
+        (0.88, 0.94, 0.97),
+        (0.84, 0.92, 0.96),
+    ]:
+        cand = tuple(select_win_numbers_with_repulsion(combined_win, count=6, p1=p1, p2=p2, p3=p3))
+        candidates[cand] = 1.0
+
+    # Small beam search on top-ranked numbers.
+    beam: List[Tuple[List[int], float]] = [([], 0.0)]
+    for depth in range(6):
+        next_beam: List[Tuple[List[int], float]] = []
+        take = int(min(len(top_idx), 7 + 2 * depth))
+        for chosen, score in beam:
+            chosen_set = set(chosen)
+            for rank, idx in enumerate(top_idx[:take]):
+                num = int(idx + 1)
+                if num in chosen_set:
+                    continue
+                if chosen:
+                    dmin = min(abs(num - x) for x in chosen)
+                else:
+                    dmin = 99
+                proximity_penalty = 0.0
+                if dmin <= 1:
+                    proximity_penalty = 0.30
+                elif dmin <= 2:
+                    proximity_penalty = 0.13
+                elif dmin <= 3:
+                    proximity_penalty = 0.05
+                add_score = float(np.log(max(1e-12, float(combined_win[idx])))) - proximity_penalty - 0.014 * float(rank)
+                next_beam.append((chosen + [num], score + add_score))
+        if not next_beam:
+            break
+        next_beam.sort(key=lambda t: t[1], reverse=True)
+        beam = next_beam[: max(48, max_candidates)]
+
+    for chosen, _ in beam:
+        if len(chosen) == 6:
+            candidates[tuple(sorted(chosen))] = 1.0
+
+    # Controlled stochastic candidates (deterministic seed derived from probability vector).
+    rng = np.random.default_rng(_candidate_seed_from_probs(combined_win))
+    num_axis = np.arange(1, 50, dtype=np.int32)
+    for _ in range(random_candidates):
+        chosen: List[int] = []
+        for _step in range(6):
+            work = np.asarray(combined_win, dtype=np.float64).copy()
+            if chosen:
+                chosen_idx = np.asarray(chosen, dtype=np.int32) - 1
+                work[chosen_idx] = 0.0
+                for num in chosen:
+                    dist = np.abs(num_axis - int(num))
+                    work[dist <= 1] *= 0.72
+                    work[(dist >= 2) & (dist <= 3)] *= 0.88
+            work = normalize_prob(work)
+            pick = int(rng.choice(num_axis, p=work))
+            if pick in chosen:
+                for fallback in np.argsort(work)[::-1]:
+                    alt = int(fallback + 1)
+                    if alt not in chosen:
+                        pick = alt
+                        break
+            chosen.append(int(pick))
+        if len(chosen) == 6:
+            candidates[tuple(sorted(chosen))] = 1.0
+
+    # Top-6 perturbations to expand nearby manifold.
+    top6 = [int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()]
+    top6 = sorted(top6)
+    for extra in top_idx[6 : min(len(top_idx), 14)]:
+        extra_num = int(extra + 1)
+        for drop_i in range(6):
+            cand = top6.copy()
+            cand[drop_i] = extra_num
+            candidates[tuple(sorted(cand))] = 1.0
+
+    cand_list = list(candidates.keys())
+    if len(cand_list) > max_candidates:
+        scored = []
+        for cand in cand_list:
+            idx = np.asarray(cand, dtype=np.int32) - 1
+            score = float(np.sum(np.log(np.clip(combined_win[idx], 1e-12, 1.0))))
+            scored.append((cand, score))
+        scored.sort(key=lambda t: t[1], reverse=True)
+        cand_list = [c for c, _ in scored[:max_candidates]]
+    return cand_list
+
+
+def win_set_feature_vector(
+    nums: List[int],
+    combined_win: np.ndarray,
+    cluster_prob: np.ndarray,
+    repel_prob: np.ndarray,
+    model_conf: float,
+) -> np.ndarray:
+    arr = np.asarray(sorted(int(x) for x in nums), dtype=np.int32)
+    idx = arr - 1
+    p = np.clip(combined_win[idx], 1e-12, 1.0)
+    c = np.clip(cluster_prob[idx], 1e-12, 1.0)
+    r = np.clip(repel_prob[idx], 1e-12, 1.0)
+    gaps = np.diff(arr).astype(np.float64) if len(arr) > 1 else np.array([0.0], dtype=np.float64)
+    span_norm = float((int(arr[-1]) - int(arr[0])) / 48.0) if len(arr) > 1 else 0.0
+    mean_gap_norm = float(np.mean(gaps) / 10.0) if len(gaps) > 0 else 0.0
+    gap_std_norm = float(np.std(gaps) / 10.0) if len(gaps) > 0 else 0.0
+    odd_count = int(np.sum(arr % 2 == 1))
+    low_count = int(np.sum(arr <= 24))
+    odd_balance = float(np.clip(1.0 - abs(odd_count - 3) / 3.0, 0.0, 1.0))
+    low_balance = float(np.clip(1.0 - abs(low_count - 3) / 3.0, 0.0, 1.0))
+    top6 = set((np.argsort(combined_win)[-6:] + 1).astype(int).tolist())
+    overlap = float(len(top6.intersection(arr.tolist())) / 6.0)
+    return np.asarray(
+        [
+            float(np.mean(np.log(p))),
+            float(np.min(np.log(p))),
+            float(np.mean(np.log(c))),
+            float(np.mean(np.log(r))),
+            span_norm,
+            mean_gap_norm,
+            gap_std_norm,
+            odd_balance,
+            low_balance,
+            overlap,
+            float(np.clip(model_conf, 0.0, 1.0)),
+        ],
+        dtype=np.float32,
+    )
+
+
+def score_candidate_with_reranker(
+    feature_vec: np.ndarray,
+    base_utility: float,
+    reranker: Dict[str, object] | None,
+) -> float:
+    if not reranker or int(float(reranker.get("enabled", 0.0))) != 1:
+        return float(base_utility)
+    coef = np.asarray(reranker.get("coef", []), dtype=np.float64).reshape(-1)
+    mean = np.asarray(reranker.get("feature_mean", []), dtype=np.float64).reshape(-1)
+    scale = np.asarray(reranker.get("feature_scale", []), dtype=np.float64).reshape(-1)
+    if len(coef) == 0 or len(feature_vec) != len(coef) or len(mean) != len(coef) or len(scale) != len(coef):
+        return float(base_utility)
+    x = (np.asarray(feature_vec, dtype=np.float64) - mean) / np.clip(scale, 1e-6, None)
+    pred = float(reranker.get("intercept", 0.0)) + float(np.dot(x, coef))
+    blend_alpha = float(np.clip(float(reranker.get("blend_alpha", 0.76)), 0.35, 0.95))
+    return float(blend_alpha * pred + (1.0 - blend_alpha) * float(base_utility))
+
+
+def build_prediction_candidates(
+    combined_win: np.ndarray,
+    combined_addl: np.ndarray,
+    cluster_prob: np.ndarray,
+    repel_prob: np.ndarray,
+    model_conf: float,
+    max_candidates: int = 96,
+    random_candidates: int = 24,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for cand in generate_win_set_candidates(
+        combined_win=combined_win,
+        max_candidates=max_candidates,
+        random_candidates=random_candidates,
+    ):
+        nums = [int(x) for x in cand]
+        base_utility = candidate_utility_from_probs(nums, combined_win=combined_win, cluster_prob=cluster_prob)
+        addl_number = choose_addl_from_probs(combined_addl, nums)
+        feat = win_set_feature_vector(nums, combined_win, cluster_prob, repel_prob, model_conf)
+        rows.append(
+            {
+                "win_numbers": nums,
+                "addl_number": int(addl_number),
+                "base_utility": float(base_utility),
+                "features": feat,
+            }
+        )
+    rows.sort(key=lambda x: float(x["base_utility"]), reverse=True)
+    return rows
+
+
+def combine_prediction(
+    pred: Dict[str, np.ndarray],
+    win_cluster_prior: np.ndarray,
+    graph_prior: np.ndarray | None,
+    addl_cluster_prior: np.ndarray,
+    repel_prior: np.ndarray,
+    weights: Dict[str, float],
+    set_reranker: Dict[str, object] | None = None,
+    rerank_candidates: int = 96,
+    rerank_random: int = 24,
+    dynamic_blend: bool = True,
+) -> Tuple[List[int], int]:
+    combined_win, combined_addl, cluster_prob, repel_prob, model_conf = build_combined_distributions(
+        pred=pred,
+        win_cluster_prior=win_cluster_prior,
+        graph_prior=graph_prior,
+        addl_cluster_prior=addl_cluster_prior,
+        repel_prior=repel_prior,
+        weights=weights,
+        dynamic_blend=dynamic_blend,
+    )
+
+    if not set_reranker or int(float(set_reranker.get("enabled", 0.0))) != 1:
+        plain_top = sorted([int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()])
+        repel_light = select_win_numbers_with_repulsion(combined_win, count=6, p1=0.93, p2=0.97, p3=0.985)
+        repel_std = select_win_numbers_with_repulsion(combined_win, count=6, p1=0.88, p2=0.94, p3=0.97)
+
+        candidates: Dict[Tuple[int, ...], float] = {}
+        for cand in (plain_top, repel_light, repel_std):
+            key = tuple(sorted(cand))
+            candidates[key] = candidate_utility_from_probs(list(key), combined_win=combined_win, cluster_prob=cluster_prob)
+        if model_conf >= 0.28:
+            candidates[tuple(plain_top)] += 0.06
+        else:
+            candidates[tuple(repel_light)] += 0.03
+        best_key = max(candidates.items(), key=lambda kv: kv[1])[0]
+        win_numbers = list(best_key)
+        addl_number = choose_addl_from_probs(combined_addl, win_numbers)
+        return win_numbers, addl_number
+
+    candidate_rows = build_prediction_candidates(
+        combined_win=combined_win,
+        combined_addl=combined_addl,
+        cluster_prob=cluster_prob,
+        repel_prob=repel_prob,
+        model_conf=model_conf,
+        max_candidates=int(max(16, rerank_candidates)),
+        random_candidates=int(max(0, rerank_random)),
+    )
+    if not candidate_rows:
+        win_numbers = sorted([int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()])
+        addl_number = choose_addl_from_probs(combined_addl, win_numbers)
+        return win_numbers, addl_number
+
+    best_row = max(
+        candidate_rows,
+        key=lambda row: score_candidate_with_reranker(
+            feature_vec=np.asarray(row["features"], dtype=np.float32),
+            base_utility=float(row["base_utility"]),
+            reranker=set_reranker,
+        ),
+    )
+    win_numbers = [int(x) for x in best_row["win_numbers"]]
+    addl_number = int(best_row["addl_number"])
     return win_numbers, addl_number
 
 
@@ -1949,11 +2329,16 @@ def evaluate_hit_score(
     target_rows: np.ndarray,
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     weights: Dict[str, float],
     sample_weights: np.ndarray | None = None,
     cached_preds: Dict[str, np.ndarray] | None = None,
+    set_reranker: Dict[str, object] | None = None,
+    rerank_candidates: int = 96,
+    rerank_random: int = 24,
+    dynamic_blend: bool = True,
 ) -> Dict[str, float]:
     if len(eval_idx) == 0:
         return {
@@ -1983,9 +2368,14 @@ def evaluate_hit_score(
         pred_win, pred_addl = combine_prediction(
             pred=pred_pack,
             win_cluster_prior=win_cluster_prior_matrix[target_row],
+            graph_prior=graph_prior_matrix[target_row],
             addl_cluster_prior=addl_cluster_prior_matrix[target_row],
             repel_prior=repel_prior_matrix[target_row],
             weights=weights,
+            set_reranker=set_reranker,
+            rerank_candidates=rerank_candidates,
+            rerank_random=rerank_random,
+            dynamic_blend=dynamic_blend,
         )
         actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
         actual_addl = int(df.loc[target_row, "Addl No."])
@@ -2040,6 +2430,352 @@ def hit_metrics_from_arrays(
     }
 
 
+def set_rerank_objective(metrics: Dict[str, float]) -> float:
+    return (
+        18.0 * float(metrics.get("avg_win_hits", 0.0))
+        + 56.0 * float(metrics.get("p_hit_ge2", 0.0))
+        + 112.0 * float(metrics.get("p_hit_ge3", 0.0))
+        + 210.0 * float(metrics.get("p_hit_ge4", 0.0))
+        + 2.0 * float(metrics.get("addl_acc", 0.0))
+    )
+
+
+def set_rerank_target_score(win_hits: int, addl_hit: int) -> float:
+    h = float(win_hits)
+    return (
+        0.48 * h
+        + 0.72 * float(h >= 2.0)
+        + 1.65 * float(h >= 3.0)
+        + 2.85 * float(h >= 4.0)
+        + 0.22 * float(addl_hit)
+    )
+
+
+def fit_set_reranker(
+    model: keras.Model,
+    scaler_x: StandardScaler,
+    X_seq: np.ndarray,
+    target_rows: np.ndarray,
+    df: pd.DataFrame,
+    win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
+    addl_cluster_prior_matrix: np.ndarray,
+    repel_prior_matrix: np.ndarray,
+    blend_weights: Dict[str, float],
+    window: int,
+    max_candidates: int,
+    random_candidates: int,
+    min_samples: int,
+    l2: float,
+    rl_epochs: int = 8,
+    rl_lr: float = 0.018,
+    hardneg_epochs: int = 4,
+    hardneg_lr: float = 0.055,
+    dynamic_blend: bool = True,
+) -> Dict[str, object]:
+    summary: Dict[str, object] = {
+        "enabled": 0.0,
+        "samples": 0.0,
+        "train_samples": 0.0,
+        "valid_samples": 0.0,
+        "candidates_per_sample": 0.0,
+        "random_candidates": 0.0,
+        "l2": float(l2),
+        "blend_alpha": 0.76,
+        "baseline_valid_avg_hits": 0.0,
+        "rerank_valid_avg_hits": 0.0,
+        "baseline_valid_p_hit_ge3": 0.0,
+        "rerank_valid_p_hit_ge3": 0.0,
+        "baseline_valid_p_hit_ge4": 0.0,
+        "rerank_valid_p_hit_ge4": 0.0,
+        "gain_avg_hits": 0.0,
+        "gain_p_hit_ge3": 0.0,
+        "gain_p_hit_ge4": 0.0,
+        "intercept": 0.0,
+        "coef": [],
+        "feature_mean": [],
+        "feature_scale": [],
+        "feature_names": list(SET_RERANK_FEATURE_NAMES),
+        "hardneg_epochs": float(max(0, hardneg_epochs)),
+        "hardneg_lr": float(max(0.0, hardneg_lr)),
+        "rl_epochs": float(max(0, rl_epochs)),
+        "rl_lr": float(max(0.0, rl_lr)),
+    }
+
+    if len(X_seq) <= 0:
+        return summary
+
+    min_train = max(96, X_seq.shape[1] * 3)
+    rerank_idx = recent_seq_indices(len(X_seq), int(max(window, min_samples)), min_train=min_train)
+    if len(rerank_idx) < int(max(12, min_samples)):
+        start = max(min_train, len(X_seq) - int(max(min_samples, window)))
+        rerank_idx = np.arange(start, len(X_seq), dtype=np.int32)
+    if len(rerank_idx) < int(max(12, min_samples // 2)):
+        return summary
+
+    n_features = X_seq.shape[-1]
+    X_eval = scaler_x.transform(X_seq[rerank_idx].reshape(-1, n_features)).reshape(
+        len(rerank_idx), X_seq.shape[1], n_features
+    ).astype(np.float32)
+    preds = predict_outputs_dict(model, X_eval)
+
+    sample_weights = recency_weights_for_target_rows(df, target_rows[np.asarray(rerank_idx, dtype=np.int32)])
+    if len(sample_weights) != len(rerank_idx):
+        sample_weights = np.ones(len(rerank_idx), dtype=np.float32)
+
+    per_sample: List[Dict[str, object]] = []
+    for local_i, seq_i in enumerate(rerank_idx):
+        target_row = int(target_rows[seq_i])
+        pred_pack = {k: v[local_i : local_i + 1] for k, v in preds.items()}
+        combined_win, combined_addl, cluster_prob, repel_prob, model_conf = build_combined_distributions(
+            pred=pred_pack,
+            win_cluster_prior=win_cluster_prior_matrix[target_row],
+            graph_prior=graph_prior_matrix[target_row],
+            addl_cluster_prior=addl_cluster_prior_matrix[target_row],
+            repel_prior=repel_prior_matrix[target_row],
+            weights=blend_weights,
+            dynamic_blend=dynamic_blend,
+        )
+        cand_rows = build_prediction_candidates(
+            combined_win=combined_win,
+            combined_addl=combined_addl,
+            cluster_prob=cluster_prob,
+            repel_prob=repel_prob,
+            model_conf=model_conf,
+            max_candidates=int(max(16, max_candidates)),
+            random_candidates=int(max(0, random_candidates)),
+        )
+        if not cand_rows:
+            continue
+        actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
+        actual_addl = int(df.loc[target_row, "Addl No."])
+        cand_eval: List[Dict[str, object]] = []
+        for row in cand_rows:
+            h, a = summarize_hits(
+                pred_win=[int(x) for x in row["win_numbers"]],
+                pred_addl=int(row["addl_number"]),
+                actual_win=actual_win,
+                actual_addl=actual_addl,
+            )
+            cand_eval.append(
+                {
+                    "features": np.asarray(row["features"], dtype=np.float32),
+                    "base_utility": float(row["base_utility"]),
+                    "hits": int(h),
+                    "addl_hit": int(a),
+                    "target": float(set_rerank_target_score(int(h), int(a))),
+                }
+            )
+        if not cand_eval:
+            continue
+        per_sample.append(
+            {
+                "sample_weight": float(sample_weights[local_i]),
+                "candidates": cand_eval,
+            }
+        )
+
+    if len(per_sample) < int(max(10, min_samples // 2)):
+        return summary
+
+    split_at = int(max(8, min(len(per_sample) - 4, round(len(per_sample) * 0.72))))
+    if split_at <= 0 or split_at >= len(per_sample):
+        return summary
+    train_samples = per_sample[:split_at]
+    valid_samples = per_sample[split_at:]
+    if len(train_samples) == 0 or len(valid_samples) == 0:
+        return summary
+
+    X_train_rows: List[np.ndarray] = []
+    y_train_rows: List[float] = []
+    sw_train_rows: List[float] = []
+    for sample in train_samples:
+        sample_w = float(sample["sample_weight"])
+        for cand in sample["candidates"]:
+            X_train_rows.append(np.asarray(cand["features"], dtype=np.float64))
+            y_train_rows.append(float(cand["target"]))
+            sw_train_rows.append(sample_w * (1.0 + 0.06 * float(cand["hits"])))
+
+    if len(X_train_rows) < max(80, len(SET_RERANK_FEATURE_NAMES) * 8):
+        return summary
+
+    X_train = np.asarray(X_train_rows, dtype=np.float64)
+    y_train = np.asarray(y_train_rows, dtype=np.float64)
+    sw_train = np.asarray(sw_train_rows, dtype=np.float64)
+    sw_train = np.clip(sw_train, 1e-6, None)
+    sw_train = sw_train / (float(np.mean(sw_train)) + 1e-12)
+
+    feat_mean = X_train.mean(axis=0)
+    feat_scale = X_train.std(axis=0)
+    feat_scale = np.where(feat_scale < 1e-6, 1.0, feat_scale)
+    Xn = (X_train - feat_mean) / feat_scale
+    X_aug = np.concatenate([np.ones((len(Xn), 1), dtype=np.float64), Xn], axis=1)
+    reg = float(max(1e-6, l2))
+    A = (X_aug * sw_train[:, None]).T @ X_aug
+    A = A + reg * np.eye(X_aug.shape[1], dtype=np.float64)
+    b = (X_aug * sw_train[:, None]).T @ y_train
+    try:
+        theta = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        theta = np.linalg.lstsq(A, b, rcond=None)[0]
+    intercept = float(theta[0])
+    coef = theta[1:].astype(np.float64)
+
+    # Stage 2A: hard-negative contrastive refinement.
+    if int(max(0, hardneg_epochs)) > 0 and float(hardneg_lr) > 0.0:
+        hn_lr = float(np.clip(hardneg_lr, 0.001, 0.25))
+        rng = np.random.default_rng(ACTIVE_SEED + 771)
+        for _ in range(int(max(0, hardneg_epochs))):
+            order = rng.permutation(len(train_samples))
+            for si in order:
+                sample = train_samples[int(si)]
+                cands = sample["candidates"]
+                if not cands:
+                    continue
+                sample_w = float(np.clip(float(sample["sample_weight"]), 0.2, 3.5))
+                Xs = np.stack(
+                    [(np.asarray(c["features"], dtype=np.float64) - feat_mean) / feat_scale for c in cands],
+                    axis=0,
+                )
+                hits = np.asarray([int(c["hits"]) for c in cands], dtype=np.int32)
+                target = np.asarray([float(c["target"]) for c in cands], dtype=np.float64)
+                base_u = np.asarray([float(c["base_utility"]) for c in cands], dtype=np.float64)
+                pos_idx = int(np.argmax(target))
+                neg_pool = np.where((hits >= 1) & (hits <= 2))[0]
+                if len(neg_pool) == 0:
+                    continue
+                neg_pool = neg_pool[np.argsort(base_u[neg_pool])[::-1]]
+                for neg_idx in neg_pool[:2]:
+                    diff = Xs[pos_idx] - Xs[int(neg_idx)]
+                    margin = 0.18 + 0.07 * float(hits[int(neg_idx)] >= 2)
+                    margin_now = float(np.dot(coef, diff))
+                    if margin_now < margin:
+                        coef += hn_lr * sample_w * (margin - margin_now) * diff
+            coef *= 0.992
+
+    # Stage 2B: direct reward learning (policy-gradient style) on sampled set candidates.
+    if int(max(0, rl_epochs)) > 0 and float(rl_lr) > 0.0:
+        pg_lr = float(np.clip(rl_lr, 0.001, 0.15))
+        rng = np.random.default_rng(ACTIVE_SEED + 1931)
+        for _ in range(int(max(0, rl_epochs))):
+            order = rng.permutation(len(train_samples))
+            for si in order:
+                sample = train_samples[int(si)]
+                cands = sample["candidates"]
+                if not cands:
+                    continue
+                sw = float(np.clip(float(sample["sample_weight"]), 0.2, 3.5))
+                Xs = np.stack(
+                    [(np.asarray(c["features"], dtype=np.float64) - feat_mean) / feat_scale for c in cands],
+                    axis=0,
+                )
+                hits = np.asarray([int(c["hits"]) for c in cands], dtype=np.int32)
+                base_u = np.asarray([float(c["base_utility"]) for c in cands], dtype=np.float64)
+                rewards = np.asarray([float(c["target"]) for c in cands], dtype=np.float64)
+
+                # Hard-negative shaping inside policy reward.
+                near_mask = ((hits >= 1) & (hits <= 2)).astype(np.float64)
+                if np.any(near_mask > 0):
+                    b_min = float(np.min(base_u))
+                    b_span = float(np.max(base_u) - b_min) + 1e-12
+                    b_rank = (base_u - b_min) / b_span
+                    rewards = rewards - 0.24 * near_mask * b_rank
+
+                logits = Xs @ coef + float(intercept)
+                logits = logits - float(np.max(logits))
+                probs = np.exp(np.clip(logits, -42.0, 42.0))
+                probs = probs / (float(np.sum(probs)) + 1e-12)
+                baseline = float(np.dot(probs, rewards))
+                adv = rewards - baseline
+                grad_logits = probs * adv
+                grad_coef = Xs.T @ grad_logits
+                grad_intercept = float(np.sum(grad_logits))
+                gnorm = float(np.linalg.norm(grad_coef)) + 1e-8
+                step = pg_lr * sw / max(1.0, gnorm)
+                coef += step * grad_coef
+                intercept += 0.08 * pg_lr * sw * grad_intercept
+            coef *= 0.994
+
+    def _sample_metrics(
+        samples: List[Dict[str, object]],
+        alpha: float | None,
+        cur_intercept: float,
+        cur_coef: np.ndarray,
+    ) -> Dict[str, float]:
+        win_hits: List[int] = []
+        addl_hits: List[int] = []
+        row_w: List[float] = []
+        for sample in samples:
+            cands = sample["candidates"]
+            if not cands:
+                continue
+            if alpha is None:
+                best = max(cands, key=lambda c: float(c["base_utility"]))
+            else:
+                def _score(cand: Dict[str, object]) -> float:
+                    x = (np.asarray(cand["features"], dtype=np.float64) - feat_mean) / feat_scale
+                    pred = float(cur_intercept) + float(np.dot(x, cur_coef))
+                    return float(alpha * pred + (1.0 - alpha) * float(cand["base_utility"]))
+                best = max(cands, key=_score)
+            win_hits.append(int(best["hits"]))
+            addl_hits.append(int(best["addl_hit"]))
+            row_w.append(float(sample["sample_weight"]))
+        if len(win_hits) == 0:
+            return hit_metrics_from_arrays(np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32))
+        return hit_metrics_from_arrays(
+            np.asarray(win_hits, dtype=np.float32),
+            np.asarray(addl_hits, dtype=np.float32),
+            sample_weights=np.asarray(row_w, dtype=np.float32),
+        )
+
+    baseline_valid = _sample_metrics(valid_samples, alpha=None, cur_intercept=intercept, cur_coef=coef)
+    best_alpha = 0.76
+    best_valid_metrics = dict(baseline_valid)
+    best_valid_obj = set_rerank_objective(best_valid_metrics)
+    best_intercept = float(intercept)
+    best_coef = np.asarray(coef, dtype=np.float64).copy()
+    for alpha in [0.58, 0.66, 0.72, 0.76, 0.82, 0.88]:
+        m = _sample_metrics(valid_samples, alpha=float(alpha), cur_intercept=intercept, cur_coef=coef)
+        s = set_rerank_objective(m)
+        if s > best_valid_obj + 1e-10:
+            best_valid_obj = float(s)
+            best_valid_metrics = dict(m)
+            best_alpha = float(alpha)
+            best_intercept = float(intercept)
+            best_coef = np.asarray(coef, dtype=np.float64).copy()
+
+    base_obj = set_rerank_objective(baseline_valid)
+    if best_valid_obj <= base_obj + 1e-10:
+        return summary
+
+    summary.update(
+        {
+            "enabled": 1.0,
+            "samples": float(len(per_sample)),
+            "train_samples": float(len(train_samples)),
+            "valid_samples": float(len(valid_samples)),
+            "candidates_per_sample": float(max_candidates),
+            "random_candidates": float(random_candidates),
+            "l2": float(reg),
+            "blend_alpha": float(best_alpha),
+            "baseline_valid_avg_hits": float(baseline_valid["avg_win_hits"]),
+            "rerank_valid_avg_hits": float(best_valid_metrics["avg_win_hits"]),
+            "baseline_valid_p_hit_ge3": float(baseline_valid["p_hit_ge3"]),
+            "rerank_valid_p_hit_ge3": float(best_valid_metrics["p_hit_ge3"]),
+            "baseline_valid_p_hit_ge4": float(baseline_valid["p_hit_ge4"]),
+            "rerank_valid_p_hit_ge4": float(best_valid_metrics["p_hit_ge4"]),
+            "gain_avg_hits": float(best_valid_metrics["avg_win_hits"] - baseline_valid["avg_win_hits"]),
+            "gain_p_hit_ge3": float(best_valid_metrics["p_hit_ge3"] - baseline_valid["p_hit_ge3"]),
+            "gain_p_hit_ge4": float(best_valid_metrics["p_hit_ge4"] - baseline_valid["p_hit_ge4"]),
+            "intercept": float(best_intercept),
+            "coef": [float(x) for x in best_coef.tolist()],
+            "feature_mean": [float(x) for x in feat_mean.tolist()],
+            "feature_scale": [float(x) for x in feat_scale.tolist()],
+        }
+    )
+    return summary
+
+
 def reward_guided_refinement(
     model: keras.Model,
     scaler_x: StandardScaler,
@@ -2049,6 +2785,7 @@ def reward_guided_refinement(
     target_rows: np.ndarray,
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     blend_weights: Dict[str, float],
@@ -2056,6 +2793,7 @@ def reward_guided_refinement(
     min_samples: int,
     epochs: int,
     batch_size: int,
+    dynamic_blend: bool = True,
 ) -> Dict[str, float]:
     summary: Dict[str, float] = {
         "enabled": 0.0,
@@ -2114,9 +2852,11 @@ def reward_guided_refinement(
         pred_win, pred_addl = combine_prediction(
             pred=pred_pack,
             win_cluster_prior=win_cluster_prior_matrix[target_row],
+            graph_prior=graph_prior_matrix[target_row],
             addl_cluster_prior=addl_cluster_prior_matrix[target_row],
             repel_prior=repel_prior_matrix[target_row],
             weights=blend_weights,
+            dynamic_blend=dynamic_blend,
         )
         actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
         actual_addl = int(df.loc[target_row, "Addl No."])
@@ -2181,9 +2921,11 @@ def reward_guided_refinement(
         target_rows=target_rows,
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         weights=blend_weights,
+        dynamic_blend=dynamic_blend,
     )
     losses = history.history.get("loss", [])
 
@@ -2268,17 +3010,17 @@ def generate_blend_candidates(base: Dict[str, float]) -> List[Dict[str, float]]:
 
     variants = [
         # model-heavy
-        {"model_soft": 0.74, "model_set": 0.86, "cluster": 0.20, "repel": 0.04, "addl_model": 0.92, "addl_cluster": 0.20},
+        {"model_soft": 0.74, "model_set": 0.86, "cluster": 0.20, "graph": 0.30, "repel": 0.04, "addl_model": 0.92, "addl_cluster": 0.20},
         # cluster-heavy
-        {"model_soft": 0.44, "model_set": 0.52, "cluster": 0.84, "repel": 0.08, "addl_model": 0.56, "addl_cluster": 0.56},
+        {"model_soft": 0.44, "model_set": 0.52, "cluster": 0.84, "graph": 0.76, "repel": 0.08, "addl_model": 0.56, "addl_cluster": 0.56},
         # balanced
-        {"model_soft": 0.56, "model_set": 0.62, "cluster": 0.62, "repel": 0.07, "addl_model": 0.74, "addl_cluster": 0.38},
+        {"model_soft": 0.56, "model_set": 0.62, "cluster": 0.62, "graph": 0.48, "repel": 0.07, "addl_model": 0.74, "addl_cluster": 0.38},
         # low repel
-        {"model_soft": 0.50, "model_set": 0.56, "cluster": 0.74, "repel": 0.02, "addl_model": 0.68, "addl_cluster": 0.44},
+        {"model_soft": 0.50, "model_set": 0.56, "cluster": 0.74, "graph": 0.52, "repel": 0.02, "addl_model": 0.68, "addl_cluster": 0.44},
         # high model_set
-        {"model_soft": 0.34, "model_set": 1.14, "cluster": 0.32, "repel": 0.06, "addl_model": 0.82, "addl_cluster": 0.30},
+        {"model_soft": 0.34, "model_set": 1.14, "cluster": 0.32, "graph": 0.26, "repel": 0.06, "addl_model": 0.82, "addl_cluster": 0.30},
         # high cluster + repel guard
-        {"model_soft": 0.38, "model_set": 0.50, "cluster": 0.92, "repel": 0.12, "addl_model": 0.60, "addl_cluster": 0.52},
+        {"model_soft": 0.38, "model_set": 0.50, "cluster": 0.92, "graph": 0.80, "repel": 0.12, "addl_model": 0.60, "addl_cluster": 0.52},
     ]
     for v in variants:
         cands.append(normalize_blend_groups(dict(v), win_total=win_total, addl_total=addl_total))
@@ -2373,6 +3115,9 @@ def normalize_blend_groups(
     min_value: float = 1e-4,
 ) -> Dict[str, float]:
     out = dict(weights)
+    for k in WIN_BLEND_KEYS + ADDL_BLEND_KEYS:
+        out[k] = float(out.get(k, min_value))
+    out["repel"] = float(out.get("repel", 0.0))
     win_vals = np.asarray([max(min_value, float(out[k])) for k in WIN_BLEND_KEYS], dtype=np.float64)
     addl_vals = np.asarray([max(min_value, float(out[k])) for k in ADDL_BLEND_KEYS], dtype=np.float64)
     win_vals *= float(max(min_value, win_total)) / float(np.sum(win_vals) + 1e-12)
@@ -2694,6 +3439,7 @@ def run_tuning(
     seq_cache: Dict[int, Tuple[np.ndarray, Dict[str, np.ndarray], np.ndarray]],
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     blend_weights: Dict[str, float],
@@ -2705,6 +3451,7 @@ def run_tuning(
     steps_per_execution: int = 0,
     cache_dataset: bool = False,
     train_recency_weighted: bool = False,
+    dynamic_blend: bool = True,
 ) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
     for trial_idx, cfg in enumerate(trial_configs, start=1):
@@ -2772,10 +3519,12 @@ def run_tuning(
                     target_rows=target_rows,
                     df=df,
                     win_cluster_prior_matrix=win_cluster_prior_matrix,
+                    graph_prior_matrix=graph_prior_matrix,
                     addl_cluster_prior_matrix=addl_cluster_prior_matrix,
                     repel_prior_matrix=repel_prior_matrix,
                     weights=blend_weights,
                     sample_weights=eval_weights,
+                    dynamic_blend=dynamic_blend,
                 )
                 fold_hit_scores.append(hit_metrics["hit_score"])
                 fold_avg_hits.append(hit_metrics["avg_win_hits"])
@@ -2810,9 +3559,11 @@ def run_tuning(
                     target_rows=target_rows,
                     df=df,
                     win_cluster_prior_matrix=win_cluster_prior_matrix,
+                    graph_prior_matrix=graph_prior_matrix,
                     addl_cluster_prior_matrix=addl_cluster_prior_matrix,
                     repel_prior_matrix=repel_prior_matrix,
                     weights=blend_weights,
+                    dynamic_blend=dynamic_blend,
                 )
                 fold_hit_scores.append(hit_metrics["hit_score"])
                 fold_avg_hits.append(hit_metrics["avg_win_hits"])
@@ -2881,11 +3632,13 @@ def calibrate_blend_weights_by_component_performance(
     target_rows: np.ndarray,
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     base_weights: Dict[str, float],
     sample_weights: np.ndarray | None = None,
     cached_preds: Dict[str, np.ndarray] | None = None,
+    dynamic_blend: bool = True,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     win_keys = list(WIN_BLEND_KEYS)
     addl_keys = list(ADDL_BLEND_KEYS)
@@ -2905,11 +3658,13 @@ def calibrate_blend_weights_by_component_performance(
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=w,
             sample_weights=sample_weights,
             cached_preds=cached_preds,
+            dynamic_blend=dynamic_blend,
         )
         score = (
             320.0 * metrics["p_hit_ge4"]
@@ -2947,11 +3702,13 @@ def calibrate_blend_weights_by_component_performance(
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=w,
             sample_weights=sample_weights,
             cached_preds=cached_preds,
+            dynamic_blend=dynamic_blend,
         )
         score = 28.0 * metrics["addl_acc"] + 2.0 * metrics["avg_win_hits"] + 18.0 * metrics["p_hit_ge2"]
         addl_scores.append(float(score))
@@ -2993,11 +3750,13 @@ def calibrate_blend_weights_by_component_performance(
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=w,
             sample_weights=sample_weights,
             cached_preds=cached_preds,
+            dynamic_blend=dynamic_blend,
         )
         score = blend_objective(metrics, focused=False)
         if score > best_repel_score:
@@ -3018,6 +3777,7 @@ def run_backtest(
     y_raw: Dict[str, np.ndarray],
     target_rows: np.ndarray,
     win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     blend_weights: Dict[str, float],
@@ -3032,6 +3792,10 @@ def run_backtest(
     steps_per_execution: int = 0,
     cache_dataset: bool = False,
     train_recency_weighted: bool = False,
+    set_reranker: Dict[str, object] | None = None,
+    rerank_candidates: int = 96,
+    rerank_random: int = 24,
+    dynamic_blend: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     n_samples = len(X_seq)
     records: List[Dict[str, object]] = []
@@ -3089,10 +3853,15 @@ def run_backtest(
                     target_rows=target_rows,
                     df=df,
                     win_cluster_prior_matrix=win_cluster_prior_matrix,
+                    graph_prior_matrix=graph_prior_matrix,
                     addl_cluster_prior_matrix=addl_cluster_prior_matrix,
                     repel_prior_matrix=repel_prior_matrix,
                     weights=blend_weights,
                     sample_weights=val_sw,
+                    set_reranker=set_reranker,
+                    rerank_candidates=rerank_candidates,
+                    rerank_random=rerank_random,
+                    dynamic_blend=dynamic_blend,
                 )
                 restart_score = float(
                     3.2 * val_metrics["avg_win_hits"]
@@ -3128,6 +3897,7 @@ def run_backtest(
                     "cluster_pred_next": next_cluster,
                     "pred_pack": pred_pack,
                     "win_cluster_prior": win_cluster_prior_matrix[target_row],
+                    "graph_prior": graph_prior_matrix[target_row],
                     "addl_cluster_prior": addl_cluster_prior_matrix[target_row],
                     "repel_prior": repel_prior_matrix[target_row],
                     "actual_win": actual_win,
@@ -3150,9 +3920,14 @@ def run_backtest(
                     pred_win, pred_addl = combine_prediction(
                         pred=item["pred_pack"],
                         win_cluster_prior=item["win_cluster_prior"],
+                        graph_prior=item["graph_prior"],
                         addl_cluster_prior=item["addl_cluster_prior"],
                         repel_prior=item["repel_prior"],
                         weights=cand,
+                        set_reranker=set_reranker,
+                        rerank_candidates=rerank_candidates,
+                        rerank_random=rerank_random,
+                        dynamic_blend=dynamic_blend,
                     )
                     h, a = summarize_hits(pred_win, pred_addl, item["actual_win"], int(item["actual_addl"]))
                     hits.append(h)
@@ -3188,9 +3963,14 @@ def run_backtest(
                 pred_win, pred_addl = combine_prediction(
                     pred=item["pred_pack"],
                     win_cluster_prior=item["win_cluster_prior"],
+                    graph_prior=item["graph_prior"],
                     addl_cluster_prior=item["addl_cluster_prior"],
                     repel_prior=item["repel_prior"],
                     weights=best_weights,
+                    set_reranker=set_reranker,
+                    rerank_candidates=rerank_candidates,
+                    rerank_random=rerank_random,
+                    dynamic_blend=dynamic_blend,
                 )
                 win_hits, addl_hit = summarize_hits(pred_win, pred_addl, item["actual_win"], int(item["actual_addl"]))
                 records.append(
@@ -3261,9 +4041,14 @@ def run_backtest(
                 pred_win, pred_addl = combine_prediction(
                     pred=pred_pack,
                     win_cluster_prior=win_cluster_prior_matrix[target_row],
+                    graph_prior=graph_prior_matrix[target_row],
                     addl_cluster_prior=addl_cluster_prior_matrix[target_row],
                     repel_prior=repel_prior_matrix[target_row],
                     weights=blend_weights,
+                    set_reranker=set_reranker,
+                    rerank_candidates=rerank_candidates,
+                    rerank_random=rerank_random,
+                    dynamic_blend=dynamic_blend,
                 )
 
                 actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
@@ -3379,6 +4164,7 @@ def build_single_html_report(
     blend_component_df: pd.DataFrame,
     calibrated_blend: Dict[str, float],
     reward_summary: Dict[str, float],
+    set_reranker_summary: Dict[str, object],
 ) -> None:
     # Horizontal one-row metrics table so it consumes less vertical space.
     metrics_df = pd.DataFrame(
@@ -3435,6 +4221,23 @@ def build_single_html_report(
         for c in reward_show.columns:
             if pd.api.types.is_numeric_dtype(reward_show[c]):
                 reward_show[c] = reward_show[c].map(lambda x: f"{x:.6f}" if isinstance(x, (float, np.floating)) else x)
+    set_rerank_show = pd.DataFrame([set_reranker_summary]).copy()
+    if not set_rerank_show.empty:
+        for c in set_rerank_show.columns:
+            if c in {"coef", "feature_mean", "feature_scale"}:
+                set_rerank_show[c] = set_rerank_show[c].map(
+                    lambda v: ", ".join(f"{x:.4f}" for x in v) if isinstance(v, list) else v
+                )
+                continue
+            if c == "feature_names":
+                set_rerank_show[c] = set_rerank_show[c].map(
+                    lambda v: ", ".join(str(x) for x in v) if isinstance(v, list) else v
+                )
+                continue
+            if pd.api.types.is_numeric_dtype(set_rerank_show[c]):
+                set_rerank_show[c] = set_rerank_show[c].map(
+                    lambda x: f"{x:.6f}" if isinstance(x, (float, np.floating)) else x
+                )
     if not metrics_df.empty:
         for c in metrics_df.columns:
             if pd.api.types.is_numeric_dtype(metrics_df[c]):
@@ -3642,6 +4445,7 @@ def build_single_html_report(
       <div class="pill"><strong>model_soft</strong><br>{calibrated_blend["model_soft"]:.6f}</div>
       <div class="pill"><strong>model_set</strong><br>{calibrated_blend["model_set"]:.6f}</div>
       <div class="pill"><strong>cluster</strong><br>{calibrated_blend["cluster"]:.6f}</div>
+      <div class="pill"><strong>graph</strong><br>{calibrated_blend.get("graph", 0.0):.6f}</div>
       <div class="pill"><strong>repel</strong><br>{calibrated_blend["repel"]:.6f}</div>
       <div class="pill"><strong>addl_model</strong><br>{calibrated_blend["addl_model"]:.6f}</div>
       <div class="pill"><strong>addl_cluster</strong><br>{calibrated_blend["addl_cluster"]:.6f}</div>
@@ -3664,6 +4468,21 @@ def build_single_html_report(
       <div class="pill"><strong>Loss (Start -> End)</strong><br>{float(reward_summary.get("loss_start", 0.0)):.4f} -> {float(reward_summary.get("loss_end", 0.0)):.4f}</div>
     </div>
     {"<h3>Reward Detail</h3><div class='grid-wrap'>" + html_table(reward_show) + "</div>" if int(float(reward_summary.get('enabled', 0.0))) == 1 else "<p class='small'>Reward refinement skipped (insufficient samples or epochs).</p>"}
+  </div>
+
+  <div class="card">
+    <h2>Set-Level Reranker</h2>
+    <div class="kpi">
+      <div class="pill"><strong>Enabled</strong><br>{int(float(set_reranker_summary.get("enabled", 0.0)))}</div>
+      <div class="pill"><strong>Samples (Train / Valid)</strong><br>{int(float(set_reranker_summary.get("train_samples", 0.0)))} / {int(float(set_reranker_summary.get("valid_samples", 0.0)))}</div>
+      <div class="pill"><strong>Candidates / Random</strong><br>{int(float(set_reranker_summary.get("candidates_per_sample", 0.0)))} / {int(float(set_reranker_summary.get("random_candidates", 0.0)))}</div>
+      <div class="pill"><strong>Blend Alpha</strong><br>{float(set_reranker_summary.get("blend_alpha", 0.0)):.4f}</div>
+      <div class="pill"><strong>Valid Avg Hits (Base -> Rerank)</strong><br>{float(set_reranker_summary.get("baseline_valid_avg_hits", 0.0)):.4f} -> {float(set_reranker_summary.get("rerank_valid_avg_hits", 0.0)):.4f}</div>
+      <div class="pill"><strong>Valid P(Hits >= 3) (Base -> Rerank)</strong><br>{float(set_reranker_summary.get("baseline_valid_p_hit_ge3", 0.0)):.4%} -> {float(set_reranker_summary.get("rerank_valid_p_hit_ge3", 0.0)):.4%}</div>
+      <div class="pill"><strong>Valid P(Hits >= 4) (Base -> Rerank)</strong><br>{float(set_reranker_summary.get("baseline_valid_p_hit_ge4", 0.0)):.4%} -> {float(set_reranker_summary.get("rerank_valid_p_hit_ge4", 0.0)):.4%}</div>
+      <div class="pill"><strong>Gain Avg / P3 / P4</strong><br>{float(set_reranker_summary.get("gain_avg_hits", 0.0)):.4f} / {float(set_reranker_summary.get("gain_p_hit_ge3", 0.0)):.4%} / {float(set_reranker_summary.get("gain_p_hit_ge4", 0.0)):.4%}</div>
+    </div>
+    {"<h3>Reranker Detail</h3><div class='grid-wrap'>" + html_table(set_rerank_show) + "</div>" if int(float(set_reranker_summary.get('enabled', 0.0))) == 1 else "<p class='small'>Reranker was disabled or did not improve validation objective.</p>"}
   </div>
 
   <div class="card">
@@ -4041,6 +4860,13 @@ def main() -> None:
             args.diffusion_samples = max(2, int(args.diffusion_samples))
             args.diffusion_future_samples = max(48, int(args.diffusion_future_samples))
             args.diffusion_window = max(48, int(args.diffusion_window))
+            if bool(args.set_rerank):
+                args.set_rerank_window = max(160, int(args.set_rerank_window))
+                args.set_rerank_candidates = max(72, int(args.set_rerank_candidates))
+                args.set_rerank_random = max(16, int(args.set_rerank_random))
+                args.set_rerank_min_samples = max(48, int(args.set_rerank_min_samples))
+                args.set_rerank_rl_epochs = max(4, int(args.set_rerank_rl_epochs))
+                args.set_rerank_hardneg_epochs = max(2, int(args.set_rerank_hardneg_epochs))
         else:
             args.tune_trials = max(int(args.tune_trials), 14)
             args.tune_epochs = max(int(args.tune_epochs), 10)
@@ -4070,6 +4896,13 @@ def main() -> None:
             args.diffusion_samples = max(int(args.diffusion_samples), 12)
             args.diffusion_future_samples = max(int(args.diffusion_future_samples), 240)
             args.diffusion_window = max(int(args.diffusion_window), 180)
+            if bool(args.set_rerank):
+                args.set_rerank_window = max(220, int(args.set_rerank_window))
+                args.set_rerank_candidates = max(96, int(args.set_rerank_candidates))
+                args.set_rerank_random = max(24, int(args.set_rerank_random))
+                args.set_rerank_min_samples = max(72, int(args.set_rerank_min_samples))
+                args.set_rerank_rl_epochs = max(8, int(args.set_rerank_rl_epochs))
+                args.set_rerank_hardneg_epochs = max(4, int(args.set_rerank_hardneg_epochs))
         print(
             "[HIT-FOCUS] enabled: "
             f"focus_last_n {prev_focus}->{args.focus_last_n}, "
@@ -4083,7 +4916,8 @@ def main() -> None:
             f"bt_topk={args.restart_ensemble_topk}, bt_opt_avg={'Y' if args.backtest_optimize_avg else 'N'}, "
             f"train_recent_w={'Y' if args.train_recency_weighted else 'N'}, "
             f"steps_per_exec={args.steps_per_execution}, cache={'Y' if args.dataset_cache else 'N'}, perf={args.perf_mode}, "
-            f"diff_trials={args.diffusion_trials}, diff_epochs={args.diffusion_epochs}, diff_steps={args.diffusion_steps}"
+            f"diff_trials={args.diffusion_trials}, diff_epochs={args.diffusion_epochs}, diff_steps={args.diffusion_steps}, "
+            f"set_rerank={'Y' if args.set_rerank else 'N'}, dyn_blend={'Y' if args.uncertainty_dynamic_blend else 'N'}"
         )
     csv_path = Path(args.csv)
     if not csv_path.exists():
@@ -4172,6 +5006,7 @@ def main() -> None:
     cluster_profile_means = pipe["cluster_profile_means"]
     line_prior_matrix = pipe["line_prior_matrix"]
     line_merge_matrix = pipe["line_merge_matrix"]
+    graph_prior_matrix = pipe["graph_prior_matrix"]
     repel_prior_matrix = pipe["repel_prior_matrix"]
     win_cluster_prior_matrix = pipe["win_cluster_prior_matrix"]
     addl_cluster_prior_matrix = pipe["addl_cluster_prior_matrix"]
@@ -4196,6 +5031,7 @@ def main() -> None:
         seq_cache=seq_cache,
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         blend_weights=BLEND_WEIGHTS,
@@ -4207,6 +5043,7 @@ def main() -> None:
         steps_per_execution=int(args.steps_per_execution),
         cache_dataset=bool(args.dataset_cache),
         train_recency_weighted=bool(args.train_recency_weighted),
+        dynamic_blend=bool(args.uncertainty_dynamic_blend),
     )
     best_row = tuning_df.iloc[0]
     best_config = ModelConfig(
@@ -4284,10 +5121,12 @@ def main() -> None:
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=BLEND_WEIGHTS,
             sample_weights=restart_eval_weights,
+            dynamic_blend=bool(args.uncertainty_dynamic_blend),
         )
         restart_score = float(blend_objective(restart_metrics, focused=bool(args.hit_score_focused)))
         restart_val_loss = float(np.min(history_i.history.get("val_loss", [math.inf])))
@@ -4343,6 +5182,7 @@ def main() -> None:
         target_rows=target_rows,
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         blend_weights=BLEND_WEIGHTS,
@@ -4350,6 +5190,7 @@ def main() -> None:
         min_samples=int(args.reward_min_samples),
         epochs=int(args.reward_epochs),
         batch_size=int(hw["batch_size"]),
+        dynamic_blend=bool(args.uncertainty_dynamic_blend),
     )
     if int(float(reward_summary.get("enabled", 0.0))) == 1:
         reverted_msg = " (reverted to pre-reward weights)" if int(float(reward_summary.get("reverted", 0.0))) == 1 else ""
@@ -4417,11 +5258,13 @@ def main() -> None:
         target_rows=target_rows,
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         base_weights=BLEND_WEIGHTS,
         sample_weights=blend_eval_weights,
         cached_preds=blend_eval_preds,
+        dynamic_blend=bool(args.uncertainty_dynamic_blend),
     )
     print(f"Adaptive calibrated blend seed: {calibrated_blend}")
     if not blend_component_df.empty:
@@ -4443,11 +5286,13 @@ def main() -> None:
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=cand,
             sample_weights=blend_eval_weights,
             cached_preds=blend_eval_preds,
+            dynamic_blend=bool(args.uncertainty_dynamic_blend),
         )
         blend_score = blend_objective(val_hit_metrics, focused=blend_focused)
         if blend_score > best_blend_score:
@@ -4464,11 +5309,13 @@ def main() -> None:
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=cand,
             sample_weights=blend_eval_weights,
             cached_preds=blend_eval_preds,
+            dynamic_blend=bool(args.uncertainty_dynamic_blend),
         )
 
     selected_blend, selected_blend_metrics, best_blend_score = coordinate_ascent_blend_search(
@@ -4498,6 +5345,75 @@ def main() -> None:
     print(f"Selected blend metrics on {blend_scope}: {selected_blend_metrics}")
     print(f"Selected blend objective on {blend_scope}: {best_blend_score:.6f}")
 
+    set_reranker_summary: Dict[str, object] = {
+        "enabled": 0.0,
+        "samples": 0.0,
+        "train_samples": 0.0,
+        "valid_samples": 0.0,
+        "candidates_per_sample": float(args.set_rerank_candidates),
+        "random_candidates": float(args.set_rerank_random),
+        "l2": float(args.set_rerank_l2),
+        "blend_alpha": 0.0,
+        "baseline_valid_avg_hits": 0.0,
+        "rerank_valid_avg_hits": 0.0,
+        "baseline_valid_p_hit_ge3": 0.0,
+        "rerank_valid_p_hit_ge3": 0.0,
+        "baseline_valid_p_hit_ge4": 0.0,
+        "rerank_valid_p_hit_ge4": 0.0,
+        "gain_avg_hits": 0.0,
+        "gain_p_hit_ge3": 0.0,
+        "gain_p_hit_ge4": 0.0,
+        "intercept": 0.0,
+        "coef": [],
+        "feature_mean": [],
+        "feature_scale": [],
+        "feature_names": list(SET_RERANK_FEATURE_NAMES),
+        "hardneg_epochs": float(args.set_rerank_hardneg_epochs),
+        "hardneg_lr": float(args.set_rerank_hardneg_lr),
+        "rl_epochs": float(args.set_rerank_rl_epochs),
+        "rl_lr": float(args.set_rerank_rl_lr),
+    }
+    if bool(args.set_rerank):
+        print(
+            "Fitting set-level reranker: "
+            f"window={args.set_rerank_window}, cands={args.set_rerank_candidates}, "
+            f"rand={args.set_rerank_random}, min_samples={args.set_rerank_min_samples}, l2={args.set_rerank_l2}"
+        )
+        set_reranker_summary = fit_set_reranker(
+            model=model,
+            scaler_x=scaler_x,
+            X_seq=X_seq,
+            target_rows=target_rows,
+            df=df,
+            win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
+            addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+            repel_prior_matrix=repel_prior_matrix,
+            blend_weights=selected_blend,
+            window=int(args.set_rerank_window),
+            max_candidates=int(args.set_rerank_candidates),
+            random_candidates=int(args.set_rerank_random),
+            min_samples=int(args.set_rerank_min_samples),
+            l2=float(args.set_rerank_l2),
+            rl_epochs=int(args.set_rerank_rl_epochs),
+            rl_lr=float(args.set_rerank_rl_lr),
+            hardneg_epochs=int(args.set_rerank_hardneg_epochs),
+            hardneg_lr=float(args.set_rerank_hardneg_lr),
+            dynamic_blend=bool(args.uncertainty_dynamic_blend),
+        )
+        if int(float(set_reranker_summary.get("enabled", 0.0))) == 1:
+            print(
+                "Set-reranker enabled. "
+                f"valid_avg_hits {set_reranker_summary.get('baseline_valid_avg_hits', 0.0):.4f} -> "
+                f"{set_reranker_summary.get('rerank_valid_avg_hits', 0.0):.4f}, "
+                f"P>=3 {set_reranker_summary.get('baseline_valid_p_hit_ge3', 0.0):.4f} -> "
+                f"{set_reranker_summary.get('rerank_valid_p_hit_ge3', 0.0):.4f}, "
+                f"P>=4 {set_reranker_summary.get('baseline_valid_p_hit_ge4', 0.0):.4f} -> "
+                f"{set_reranker_summary.get('rerank_valid_p_hit_ge4', 0.0):.4f}"
+            )
+        else:
+            print("Set-reranker skipped or rejected (no validation improvement).")
+
     # Walk-forward expanding-window backtest for historical validation.
     if args.focus_last_n > 0:
         print(f"Running strict walk-forward backtest on last {args.focus_last_n} draws, epochs={args.backtest_epochs}")
@@ -4512,6 +5428,7 @@ def main() -> None:
         y_raw=y_raw,
         target_rows=target_rows,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         blend_weights=selected_blend,
@@ -4526,6 +5443,10 @@ def main() -> None:
         steps_per_execution=int(args.steps_per_execution),
         cache_dataset=bool(args.dataset_cache),
         train_recency_weighted=bool(args.train_recency_weighted),
+        set_reranker=set_reranker_summary,
+        rerank_candidates=int(args.set_rerank_candidates),
+        rerank_random=int(args.set_rerank_random),
+        dynamic_blend=bool(args.uncertainty_dynamic_blend),
     )
 
     # Final prediction for next draw using latest sequence + cluster trend priors.
@@ -4553,9 +5474,14 @@ def main() -> None:
     pred_win, pred_addl = combine_prediction(
         pred=pred_latest,
         win_cluster_prior=win_cluster_next_prior,
+        graph_prior=normalize_prob(graph_prior_matrix[-1]),
         addl_cluster_prior=addl_cluster_next_prior,
         repel_prior=repel_next_prior,
         weights=selected_blend,
+        set_reranker=set_reranker_summary,
+        rerank_candidates=int(args.set_rerank_candidates),
+        rerank_random=int(args.set_rerank_random),
+        dynamic_blend=bool(args.uncertainty_dynamic_blend),
     )
 
     diff_pred_win = [int(x) for x in diffusion_summary["diffusion_pred_win"]]
@@ -4685,6 +5611,7 @@ def main() -> None:
         blend_component_df=blend_component_df,
         calibrated_blend=calibrated_blend,
         reward_summary=reward_summary,
+        set_reranker_summary=set_reranker_summary,
     )
 
     print("")
