@@ -8,8 +8,6 @@ ToTo deep learning with:
 from __future__ import annotations
 
 import argparse
-import base64
-import io
 import itertools
 import json
 import math
@@ -18,12 +16,12 @@ import random
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
@@ -104,14 +102,15 @@ WIN_COLS = ["Win_1", "Win_2", "Win_3", "Win_4", "Win_5", "Win_6"]
 PRIMARY_COLS = WIN_COLS + ["Addl No."]
 
 BLEND_WEIGHTS = {
-    "model_soft": 0.9586,
-    "cluster": 0.4802,
-    "graph": 0.4024,
-    "repel": 0.1677,
+    "model_soft": 1.1820,
+    "graph": 1.2060,
+    "embed": 0.8120,
+    "cluster": 0.8900,
+    "repel": 0.1240,
     "addl_model": 0.7784,
 }
 
-WIN_BLEND_KEYS = ["model_soft", "cluster", "graph"]
+WIN_BLEND_KEYS = ["model_soft", "graph", "embed", "cluster"]
 ADDL_BLEND_KEYS = ["addl_model"]
 
 DEFAULT_FEATURE_GROUP_WEIGHTS = {
@@ -119,7 +118,8 @@ DEFAULT_FEATURE_GROUP_WEIGHTS = {
     "other": 1.25,
     "repel": 1.20,
     "cluster": 1.35,
-    "line": 1.60,
+    "graph": 1.60,
+    "embed": 1.45,
 }
 
 
@@ -133,17 +133,39 @@ class ModelConfig:
     lr: float
 
 
+@dataclass
+class RewardReranker:
+    feature_mean: np.ndarray
+    feature_std: np.ndarray
+    coef: np.ndarray
+    intercept: float
+    reward_scale: float = 0.55
+
+    def score(self, feat: np.ndarray) -> float:
+        x = np.asarray(feat, dtype=np.float64).reshape(-1)
+        z = (x - self.feature_mean) / self.feature_std
+        return float(self.intercept + np.dot(z, self.coef))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ToTo Predication Report"
     )
     parser.add_argument("--seed", type=int, default=SEED, help="Global random seed")
     parser.add_argument("--sweep-mode", action="store_true", help="Use lighter settings for automated multi-run sweeps")
-    parser.add_argument("--csv", default="ToTo-09_Mar_2026.csv", help="Input CSV file path")
+    parser.add_argument("--csv", default="ToTo-12_Mar_2026.csv", help="Input CSV file path")
     parser.add_argument("--clusters", type=int, default=0, help="Force KMeans clusters (0=auto)")
     parser.add_argument("--tune-trials", type=int, default=14, help="Random trials sampled from config space")
     parser.add_argument("--tune-folds", type=int, default=3, help="Walk-forward folds per tuning trial")
     parser.add_argument("--tune-epochs", type=int, default=10, help="Epoch cap for each tuning fold")
+    parser.add_argument(
+        "--tune-multifidelity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use two-stage multi-fidelity tuning (short stage + full stage on shortlist)",
+    )
+    parser.add_argument("--tune-mf-stage1-epochs", type=int, default=5, help="Epoch cap for stage-1 multi-fidelity tuning")
+    parser.add_argument("--tune-mf-keep-ratio", type=float, default=0.45, help="Top ratio kept from stage-1 into full stage-2 tuning")
     parser.add_argument("--multi-restarts", type=int, default=5, help="Number of final-training restarts (best restart kept by hit objective)")
     parser.add_argument("--final-epochs", type=int, default=64, help="Final training epoch cap")
     parser.add_argument("--backtest-folds", type=int, default=10, help="Expanding-window backtest folds")
@@ -151,7 +173,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--focus-last-n",
         type=int,
-        default=10,
+        default=24,
         help="Optimize and backtest only the most recent N draws (0 disables recent-focus mode)",
     )
     parser.add_argument("--output-html", default="", help="Output HTML path (optional)")
@@ -159,7 +181,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-other", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["other"], help="Feature weight for non-primary scalar columns")
     parser.add_argument("--w-repel", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["repel"], help="Feature weight for repel features")
     parser.add_argument("--w-cluster", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["cluster"], help="Feature weight for cluster-prior features")
-    parser.add_argument("--w-line", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["line"], help="Feature weight for line-endpoint convergence features")
+    parser.add_argument("--w-graph", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["graph"], help="Feature weight for graph co-occurrence features")
+    parser.add_argument("--w-embed", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["embed"], help="Feature weight for embedding-pattern features")
+    parser.add_argument("--w-line", dest="w_graph", type=float, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument(
         "--perf-mode",
         choices=["auto", "high"],
@@ -203,10 +227,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backtest-restarts", type=int, default=1, help="Model restarts per walk-forward step (recent-focus mode)")
     parser.add_argument("--restart-ensemble-topk", type=int, default=1, help="Average top-K restarts per walk-forward step")
     parser.add_argument(
+        "--backtest-no-retrain",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use the final trained model for backtest inference (skip per-step retraining for speed)",
+    )
+    parser.add_argument(
         "--backtest-optimize-avg",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Optimize strict walk-forward local blend for avg_win_hits emphasis",
+    )
+    parser.add_argument(
+        "--latest-priority-n",
+        type=int,
+        default=5,
+        help="Latest N backtest samples to strongly prioritize in optimization objectives (0 disables tail-priority)",
+    )
+    parser.add_argument(
+        "--latest-priority-boost",
+        type=float,
+        default=3.4,
+        help="Multiplicative recency boost applied to the latest-priority window",
+    )
+    parser.add_argument(
+        "--latest-priority-lambda",
+        type=float,
+        default=2.2,
+        help="Extra objective weight on latest-priority win-hit performance during backtest blend search",
+    )
+    parser.add_argument(
+        "--latest-priority-addl-lambda",
+        type=float,
+        default=1.6,
+        help="Extra objective weight on latest-priority additional-number hit performance",
     )
     parser.add_argument(
         "--uncertainty-dynamic-blend",
@@ -214,6 +268,38 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Apply entropy/temperature-calibrated dynamic per-draw blend weighting",
     )
+    parser.add_argument("--candidate-max-pool", type=int, default=48, help="Maximum unique win-set candidates scored per prediction")
+    parser.add_argument("--candidate-gumbel-samples", type=int, default=28, help="Stochastic Gumbel-top-k candidate samples per prediction")
+    parser.add_argument("--candidate-diversity-lambda", type=float, default=0.11, help="Penalty strength for low-spread candidate sets")
+    parser.add_argument(
+        "--expected-hit-rerank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add expected-hit utility term during candidate ranking (avg-hit oriented)",
+    )
+    parser.add_argument("--expected-hit-lambda", type=float, default=2.20, help="Weight for expected-hit utility term")
+    parser.add_argument("--expected-hit-synergy-lambda", type=float, default=0.48, help="Weight for component-consensus utility term")
+    parser.add_argument("--anti-repeat-window", type=int, default=10, help="Recent prediction window used to penalize repeated win sets")
+    parser.add_argument("--anti-repeat-lambda", type=float, default=1.25, help="Penalty strength against repeated/high-overlap predicted win sets")
+    parser.add_argument(
+        "--avg-hit-focused",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Profile that prioritizes avg_win_hits over tail-only metrics",
+    )
+    parser.add_argument(
+        "--reward-rerank",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable reward-model reranking on candidate win sets",
+    )
+    parser.add_argument("--reward-window", type=int, default=72, help="Recent tuning rows used to fit reward reranker")
+    parser.add_argument("--reward-a", type=float, default=1.0, help="Reward coefficient for hit count")
+    parser.add_argument("--reward-b", type=float, default=2.4, help="Reward bonus for hits>=3")
+    parser.add_argument("--reward-c", type=float, default=6.8, help="Reward bonus for hits>=4")
+    parser.add_argument("--reward-hardneg-boost", type=float, default=0.9, help="Extra weight for hard negatives (hits 1-2) in reward fitting")
+    parser.add_argument("--reward-ridge", type=float, default=0.18, help="L2 regularization for reward reranker fit")
+    parser.add_argument("--reward-scale", type=float, default=0.55, help="Blend scale for reward reranker score at inference time")
     parser.add_argument(
         "--feature-weight-trials",
         type=int,
@@ -225,18 +311,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=6,
         help="Epoch cap used during feature-weight tuning proxy fits",
-    )
-    parser.add_argument(
-        "--diffusion-window",
-        type=int,
-        default=180,
-        help="Recent rows used for pattern proxy image (clamped to available rows)",
-    )
-    parser.add_argument(
-        "--diffusion-future-samples",
-        type=int,
-        default=240,
-        help="Synthetic windows used for diffusion next-day prediction",
     )
     return parser.parse_args()
 
@@ -355,171 +429,14 @@ def prepare_dataframe(df_raw: pd.DataFrame) -> Tuple[pd.DataFrame, List[str], Li
     return df, PRIMARY_COLS, other_cols
 
 
-def build_role_encoded_grid(df: pd.DataFrame) -> np.ndarray:
-    """
-    Encode Win_1..Win_6 + Addl No. into a draw x number grid.
-    Values are role-intensity encoded for diffusion image learning.
-    """
-    n = len(df)
-    grid = np.zeros((n, 49), dtype=np.float32)
-    row_idx = np.arange(n)
-
-    for role_i, col in enumerate(WIN_COLS, start=1):
-        nums = np.clip(df[col].astype(int).values, 1, 49) - 1
-        grid[row_idx, nums] = role_i / 7.5
-
-    addl_nums = np.clip(df["Addl No."].astype(int).values, 1, 49) - 1
-    grid[row_idx, addl_nums] = 1.0
-    return grid
-
-
-def build_binary_draw_grid(df: pd.DataFrame) -> np.ndarray:
-    n = len(df)
-    grid = np.zeros((n, 49), dtype=np.float32)
-    row_idx = np.arange(n)
-    for col in PRIMARY_COLS:
-        nums = np.clip(df[col].astype(int).values, 1, 49) - 1
-        grid[row_idx, nums] = 1.0
-    return grid
-
-
-def topk_binary_rows(matrix: np.ndarray, k: int = 7) -> np.ndarray:
-    n, w = matrix.shape
-    out = np.zeros((n, w), dtype=np.float32)
-    kk = int(max(1, min(k, w)))
-    idx = np.argpartition(matrix, -kk, axis=1)[:, -kk:]
-    rows = np.arange(n)[:, None]
-    out[rows, idx] = 1.0
-    return out
-
-
-def evaluate_pattern_match(
-    generated: np.ndarray,
-    target_role: np.ndarray,
-    target_binary: np.ndarray,
-) -> Dict[str, object]:
-    gen_binary = topk_binary_rows(generated, k=7)
-    overlap = gen_binary * target_binary
-    hit_rate = float(overlap.sum() / max(1.0, target_binary.sum()))
-    mse = float(np.mean((generated - target_role) ** 2))
-    acc_map = 1.0 - np.abs(generated - target_role)
-    row_hits = overlap.sum(axis=1).astype(float)
-    row_hit_ge3 = float(np.mean(row_hits >= 3.0))
-    row_hit_ge4 = float(np.mean(row_hits >= 4.0))
-
-    target_mass = float(np.sum(target_role)) + 1e-8
-    role_match = float(np.sum(generated * target_role) / target_mass)
-
-    gen_profile = generated.mean(axis=0).astype(np.float64)
-    tgt_profile = target_role.mean(axis=0).astype(np.float64)
-    profile_den = (np.linalg.norm(gen_profile) * np.linalg.norm(tgt_profile)) + 1e-8
-    profile_cos = float(np.dot(gen_profile, tgt_profile) / profile_den)
-    profile_cos = float(np.clip(profile_cos, 0.0, 1.0))
-
-    row_num = np.sum(generated * target_role, axis=1).astype(np.float64)
-    row_den = (np.linalg.norm(generated, axis=1) * np.linalg.norm(target_role, axis=1)) + 1e-8
-    row_cos = np.clip(row_num / row_den, 0.0, 1.0)
-    row_cos_mean = float(np.mean(row_cos))
-
-    score = (
-        0.36 * hit_rate
-        + 0.16 * row_hit_ge3
-        + 0.08 * row_hit_ge4
-        + 0.15 * role_match
-        + 0.13 * profile_cos
-        + 0.08 * row_cos_mean
-        + 0.04 * (1.0 - mse)
-    )
-    score = float(np.clip(score, 0.0, 1.0))
-    return {
-        "score": score,
-        "hit_rate": hit_rate,
-        "mse": mse,
-        "row_hit_ge3": row_hit_ge3,
-        "row_hit_ge4": row_hit_ge4,
-        "role_match": role_match,
-        "profile_cos": profile_cos,
-        "row_cos": row_cos_mean,
-        "overlap_map": overlap.astype(np.float32),
-        "accuracy_map": np.clip(acc_map, 0.0, 1.0).astype(np.float32),
-        "row_hits": row_hits.astype(np.float32),
-    }
-
-
-def build_diffusion_proxy_suite(
-    df: pd.DataFrame,
-    window: int,
-    future_samples: int,
-) -> Dict[str, object]:
-    """
-    Lightweight non-training proxy for diffusion outputs.
-    Diffusion training itself has not improved avg_win_hits, so this keeps
-    report compatibility while removing that heavy training path.
-    """
-    window = int(max(24, min(window, len(df))))
-    role_grid = build_role_encoded_grid(df)
-    binary_grid = build_binary_draw_grid(df)
-    target_role = role_grid[-window:].astype(np.float32)
-    target_binary = binary_grid[-window:].astype(np.float32)
-
-    recency = np.exp(np.linspace(-2.2, 0.0, window, dtype=np.float64)).reshape(-1, 1)
-    profile = normalize_prob(np.sum(target_binary * recency, axis=0))
-    last_role = normalize_prob(target_role[-1].astype(np.float64) + 1e-6)
-    generated_row = normalize_prob(0.72 * profile + 0.28 * last_role)
-    generated_role = np.tile(generated_row, (window, 1)).astype(np.float32)
-
-    metrics = evaluate_pattern_match(generated_role, target_role, target_binary)
-    next_prior = normalize_prob(0.78 * profile + 0.22 * normalize_prob(target_binary[-1]))
-    win_numbers = sorted([int(i + 1) for i in np.argsort(next_prior)[-6:].tolist()])
-    addl_number = int(next((i + 1 for i in np.argsort(next_prior)[::-1] if (i + 1) not in win_numbers), np.argmax(next_prior) + 1))
-
-    row_idx = np.arange(len(df) - window, len(df))
-    row_labels = [str(int(df.loc[i, "Draw"])) if not pd.isna(df.loc[i, "Draw"]) else str(i) for i in row_idx]
-    trial_df = pd.DataFrame(
-        [
-            {
-                "trial": 1,
-                "filters": 0,
-                "lr": 0.0,
-                "epochs": 0,
-                "best_score": float(metrics["score"]),
-                "best_hit_rate": float(metrics["hit_rate"]),
-                "best_mse": float(metrics["mse"]),
-                "final_train_loss": 0.0,
-            }
-        ]
-    )
-    best_trial_row = trial_df.iloc[0].to_dict()
-
-    return {
-        "window": window,
-        "row_labels": row_labels,
-        "target_role": target_role,
-        "generated_role": generated_role,
-        "accuracy_map": np.asarray(metrics["accuracy_map"], dtype=np.float32),
-        "overlap_map": np.asarray(metrics["overlap_map"], dtype=np.float32),
-        "row_hits": np.asarray(metrics["row_hits"], dtype=np.float32),
-        "trial_df": trial_df,
-        "trial_best": best_trial_row,
-        "trial_loss_curve": [float(metrics["mse"])],
-        "trial_hit_rate": float(metrics["hit_rate"]),
-        "trial_mse": float(metrics["mse"]),
-        "trial_score": float(metrics["score"]),
-        "diffusion_pred_win": win_numbers,
-        "diffusion_pred_addl": addl_number,
-        "diffusion_next_win_prob": next_prior.astype(np.float32),
-        "diffusion_next_row_prior": next_prior.astype(np.float32),
-        "future_windows_used": int(max(24, future_samples)),
-    }
-
-
 def feature_group_weights_from_args(args: argparse.Namespace) -> Dict[str, float]:
     return {
         "primary": float(args.w_primary),
         "other": float(args.w_other),
         "repel": float(args.w_repel),
         "cluster": float(args.w_cluster),
-        "line": float(args.w_line),
+        "graph": float(args.w_graph),
+        "embed": float(args.w_embed),
     }
 
 
@@ -557,11 +474,11 @@ def build_feature_pipeline(
     cluster_model, best_k, silhouette = build_cluster_model(X_cluster_scaled, forced_clusters)
     cluster_labels = cluster_model.labels_
 
-    line_system = build_line_endpoint_system(df)
-    line_prior_matrix = line_system["line_prior"]
-    line_merge_matrix = line_system["line_merge"]
     cooc_system = build_cooccurrence_system(df)
     cooc_prior_matrix = cooc_system["cooc_prior"]
+    embed_system = build_embedding_pattern_system(df)
+    embed_prior_matrix = np.asarray(embed_system["embed_prior"], dtype=np.float32)
+    addl_embed_prior_matrix = np.asarray(embed_system["addl_embed_prior"], dtype=np.float32)
     repel_system = build_repel_system(df)
     repel_prior_matrix = repel_system["repel_prior"]
 
@@ -571,41 +488,37 @@ def build_feature_pipeline(
         k=best_k,
     )
 
-    line_cols = [f"LinePrior_{i+1}" for i in range(49)]
-    line_merge_cols = [f"LineMerge_{i+1}" for i in range(49)]
     cooc_cols = [f"Cooc_{i+1}" for i in range(49)]
+    embed_cols = [f"EmbedPrior_{i+1}" for i in range(49)]
     repel_cols = [f"Repel_{i+1}" for i in range(49)]
     cluster_prior_cols = [f"ClusterPrior_{i+1}" for i in range(49)]
 
     extra_features = pd.DataFrame(
         np.hstack(
             [
-                line_prior_matrix,
-                line_merge_matrix,
                 cooc_prior_matrix,
+                embed_prior_matrix,
                 repel_prior_matrix,
                 win_cluster_prior_matrix,
             ]
         ),
-        columns=line_cols + line_merge_cols + cooc_cols + repel_cols + cluster_prior_cols,
+        columns=cooc_cols + embed_cols + repel_cols + cluster_prior_cols,
         index=df.index,
     )
     df_features = pd.concat([df.copy(), extra_features], axis=1)
 
     feature_cols = (
         base_feature_cols
-        + line_cols
-        + line_merge_cols
         + cooc_cols
+        + embed_cols
         + repel_cols
         + cluster_prior_cols
     )
     feature_weights = np.array(
         [group_weights["primary"]] * len(primary_cols)
         + [group_weights["other"]] * len(other_cols)
-        + [group_weights["line"]] * len(line_cols)
-        + [group_weights["line"]] * len(line_merge_cols)
-        + [group_weights["line"]] * len(cooc_cols)
+        + [group_weights["graph"]] * len(cooc_cols)
+        + [group_weights["embed"]] * len(embed_cols)
         + [group_weights["repel"]] * len(repel_cols)
         + [group_weights["cluster"]] * len(cluster_prior_cols),
         dtype=np.float32,
@@ -632,13 +545,17 @@ def build_feature_pipeline(
         "silhouette": float(silhouette),
         "embedding": embedding,
         "cluster_profile_means": cluster_profile_means,
-        "line_prior_matrix": line_prior_matrix,
-        "line_merge_matrix": line_merge_matrix,
         "graph_prior_matrix": cooc_prior_matrix,
+        "embed_prior_matrix": embed_prior_matrix,
+        "addl_embed_prior_matrix": addl_embed_prior_matrix,
         "repel_prior_matrix": repel_prior_matrix,
         "win_cluster_prior_matrix": win_cluster_prior_matrix,
         "addl_cluster_prior_matrix": addl_cluster_prior_matrix,
         "cluster_transition_matrix": cluster_transition_matrix,
+        "embedding_prior_info": {
+            "embed_dim": int(embed_system["embed_dim"]),
+            "mean_confidence": float(embed_system["mean_confidence"]),
+        },
     }
 
 
@@ -702,6 +619,7 @@ def tune_feature_group_weights(
                 df=pipe["df_features"],
                 win_cluster_prior_matrix=pipe["win_cluster_prior_matrix"],
                 graph_prior_matrix=pipe["graph_prior_matrix"],
+                embed_prior_matrix=pipe["embed_prior_matrix"],
                 addl_cluster_prior_matrix=pipe["addl_cluster_prior_matrix"],
                 repel_prior_matrix=pipe["repel_prior_matrix"],
                 weights=BLEND_WEIGHTS,
@@ -743,15 +661,6 @@ def tune_feature_group_weights(
     if not tune_df.empty:
         tune_df = tune_df.sort_values(["score", "proxy_p_hit_ge4", "proxy_p_hit_ge3", "proxy_avg_hits"], ascending=[False, False, False, False]).reset_index(drop=True)
     return best_weights, tune_df
-
-
-def fig_to_base64(fig: plt.Figure) -> str:
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=180, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return base64.b64encode(buf.read()).decode("utf-8")
-
 
 def build_cluster_model(X_scaled: np.ndarray, forced_clusters: int = 0) -> Tuple[KMeans, int, float]:
     if forced_clusters > 1:
@@ -807,72 +716,6 @@ def build_repel_system(
     return {"repel_prior": repel.astype(np.float32)}
 
 
-def build_line_endpoint_system(
-    df: pd.DataFrame,
-    lookback: int = 26,
-    recency_decay: float = 0.88,
-    sigma: float = 1.08,
-    slope_clip: int = 14,
-) -> Dict[str, np.ndarray]:
-    """
-    Endpoint-convergence prior inspired by manual line-drawing strategy.
-    For each step t, project lines from historical consecutive draw pairs:
-      a -> b  (from t-lag-1 to t-lag), endpoint candidate = b + (b-a)
-    Numbers receiving many projected endpoints become high-probability targets.
-    """
-    n = len(df)
-    draw_all = df[WIN_COLS + ["Addl No."]].values.astype(np.int32)
-    num_axis = np.arange(1, 50, dtype=np.float32)
-
-    endpoint_field = np.zeros((n, 49), dtype=np.float32)
-    merge_field = np.zeros((n, 49), dtype=np.float32)
-    uniform = np.ones(49, dtype=np.float32) / 49.0
-
-    for t in range(n):
-        if t < 2:
-            endpoint_field[t] = uniform
-            merge_field[t] = uniform
-            continue
-
-        smooth_score = np.zeros(49, dtype=np.float64)
-        merge_count = np.zeros(49, dtype=np.float64)
-
-        max_lag = min(lookback, t - 1)
-        for lag in range(1, max_lag + 1):
-            w = recency_decay ** (lag - 1)
-            row_a = draw_all[t - lag - 1]
-            row_b = draw_all[t - lag]
-            for a in row_a:
-                for b in row_b:
-                    delta = int(b) - int(a)
-                    if abs(delta) > slope_clip:
-                        continue
-                    endpoint = int(b) + delta
-                    if endpoint < 1 or endpoint > 49:
-                        continue
-                    dist = np.abs(num_axis - float(endpoint))
-                    smooth_score += w * np.exp(-(dist * dist) / (2.0 * sigma * sigma))
-                    merge_count[endpoint - 1] += w
-
-        if smooth_score.sum() > 1e-12:
-            endpoint_field[t] = (smooth_score / smooth_score.sum()).astype(np.float32)
-        else:
-            endpoint_field[t] = uniform
-
-        if merge_count.sum() > 1e-12:
-            merge_field[t] = (merge_count / merge_count.sum()).astype(np.float32)
-        else:
-            merge_field[t] = uniform
-
-    line_prior = 0.74 * endpoint_field + 0.26 * merge_field
-    line_prior = line_prior / (line_prior.sum(axis=1, keepdims=True) + 1e-8)
-    return {
-        "line_prior": line_prior.astype(np.float32),
-        "line_endpoint": endpoint_field.astype(np.float32),
-        "line_merge": merge_field.astype(np.float32),
-    }
-
-
 def build_cooccurrence_system(
     df: pd.DataFrame,
     decay: float = 0.989,
@@ -923,6 +766,147 @@ def build_cooccurrence_system(
     return {"cooc_prior": cooc_prior.astype(np.float32)}
 
 
+def build_embedding_pattern_system(
+    df: pd.DataFrame,
+    decay: float = 0.992,
+    context_window: int = 12,
+    embed_dim: int = 12,
+    temperature: float = 0.82,
+    addl_strength: float = 0.30,
+) -> Dict[str, np.ndarray | float | int]:
+    """
+    History-only vector embedding prior:
+    - number vectors come from projected transition-context rows,
+    - context comes from recent draws,
+    - pattern priors come from single-slot and adjacent-pair transitions.
+    """
+    n = len(df)
+    draw_win = df[WIN_COLS].values.astype(np.int32) - 1
+    draw_addl = df["Addl No."].values.astype(np.int32) - 1
+
+    embed_prior = np.zeros((n, 49), dtype=np.float32)
+    addl_embed_prior = np.zeros((n, 49), dtype=np.float32)
+    uniform = np.ones(49, dtype=np.float64) / 49.0
+
+    freq = np.ones(49, dtype=np.float64)
+    trans = np.ones((49, 49), dtype=np.float64)
+    addl_trans = np.ones((49, 49), dtype=np.float64)
+    single_slot_next = np.ones((6, 49, 49), dtype=np.float64) * 0.10
+    pair_next: Dict[Tuple[int, int, int], np.ndarray] = {}
+
+    d = int(np.clip(embed_dim, 6, 32))
+    rng = np.random.default_rng(ACTIVE_SEED + 211)
+    proj = rng.normal(0.0, 1.0, size=(49, d)).astype(np.float64)
+    proj /= np.linalg.norm(proj, axis=0, keepdims=True) + 1e-12
+
+    confidences: List[float] = []
+    for t in range(n):
+        if t == 0:
+            embed_prior[t] = uniform.astype(np.float32)
+            addl_embed_prior[t] = uniform.astype(np.float32)
+        else:
+            # Number "embeddings" from projected transition-context rows.
+            context_rows = trans / (trans.sum(axis=1, keepdims=True) + 1e-12)
+            num_vec = context_rows @ proj
+            num_vec /= np.linalg.norm(num_vec, axis=1, keepdims=True) + 1e-12
+
+            start = max(0, t - int(max(2, context_window)))
+            recent_wins = draw_win[start:t].reshape(-1)
+            recent_addl = draw_addl[start:t]
+            if len(recent_wins) > 0:
+                ctx = np.mean(num_vec[recent_wins], axis=0)
+            else:
+                ctx = np.mean(num_vec, axis=0)
+            if len(recent_addl) > 0:
+                ctx = ctx + 0.30 * np.mean(num_vec[recent_addl], axis=0)
+            ctx_norm = float(np.linalg.norm(ctx)) + 1e-12
+            sim = (num_vec @ ctx) / ctx_norm
+            sim = sim - float(np.max(sim))
+            emb_prob = np.exp(sim / float(np.clip(temperature, 0.55, 1.45)))
+            emb_prob = normalize_prob(emb_prob)
+
+            prev_unique = np.unique(draw_win[t - 1]).astype(np.int32)
+            prev_addl = int(draw_addl[t - 1])
+            prev_row = draw_win[t - 1]
+
+            trans_prior = normalize_prob(np.mean(trans[prev_unique], axis=0))
+            single_prior = normalize_prob(
+                np.mean(single_slot_next[np.arange(6), prev_row], axis=0)
+            )
+
+            pair_acc = np.zeros(49, dtype=np.float64)
+            pair_hits = 0
+            for pos in range(5):
+                key = (int(prev_row[pos]), int(prev_row[pos + 1]), pos)
+                arr = pair_next.get(key)
+                if arr is not None:
+                    pair_acc += arr
+                    pair_hits += 1
+            if pair_hits > 0:
+                pair_prior = normalize_prob(pair_acc)
+            else:
+                pair_prior = trans_prior
+
+            freq_prior = normalize_prob(freq)
+            win_prior = normalize_prob(
+                0.34 * emb_prob
+                + 0.28 * trans_prior
+                + 0.20 * single_prior
+                + 0.10 * pair_prior
+                + 0.08 * freq_prior
+            )
+            addl_prior = normalize_prob(
+                0.52 * normalize_prob(addl_trans[prev_addl])
+                + 0.28 * emb_prob
+                + 0.20 * freq_prior
+            )
+
+            embed_prior[t] = win_prior.astype(np.float32)
+            addl_embed_prior[t] = addl_prior.astype(np.float32)
+            confidences.append(float(np.max(win_prior)))
+
+        # Decay old evidence, then consume current row evidence.
+        freq *= decay
+        trans *= decay
+        addl_trans *= decay
+        single_slot_next *= decay
+
+        wins_t = np.unique(draw_win[t]).astype(np.int32)
+        addl_t = int(draw_addl[t])
+        freq[wins_t] += 1.0
+        freq[addl_t] += float(addl_strength)
+
+        if t > 0:
+            prev_unique = np.unique(draw_win[t - 1]).astype(np.int32)
+            prev_addl = int(draw_addl[t - 1])
+            trans[np.ix_(prev_unique, wins_t)] += 1.0
+            trans[prev_unique, addl_t] += 0.28
+            addl_trans[prev_addl, wins_t] += 0.42
+            addl_trans[prev_addl, addl_t] += 0.74
+
+            prev_row = draw_win[t - 1]
+            for pos in range(6):
+                a = int(prev_row[pos])
+                single_slot_next[pos, a, wins_t] += 1.0
+                single_slot_next[pos, a, addl_t] += 0.22
+            for pos in range(5):
+                key = (int(prev_row[pos]), int(prev_row[pos + 1]), pos)
+                arr = pair_next.get(key)
+                if arr is None:
+                    arr = np.ones(49, dtype=np.float64) * 1e-3
+                    pair_next[key] = arr
+                arr[wins_t] += 1.0
+                arr[addl_t] += 0.22
+
+    mean_conf = float(np.mean(confidences)) if confidences else float(1.0 / 49.0)
+    return {
+        "embed_prior": embed_prior.astype(np.float32),
+        "addl_embed_prior": addl_embed_prior.astype(np.float32),
+        "embed_dim": int(d),
+        "mean_confidence": float(mean_conf),
+    }
+
+
 def build_dynamic_cluster_priors(
     df: pd.DataFrame,
     cluster_labels: np.ndarray,
@@ -967,99 +951,6 @@ def build_dynamic_cluster_priors(
 
     trans = trans / trans.sum(axis=1, keepdims=True)
     return win_prior, addl_prior, trans.astype(np.float32)
-
-
-def cluster_scatter_img(embedding: np.ndarray, labels: np.ndarray) -> str:
-    fig, ax = plt.subplots(figsize=(11, 7))
-    scatter = ax.scatter(embedding[:, 0], embedding[:, 1], c=labels, cmap="tab20", s=22, alpha=0.86, edgecolor="none")
-    ax.set_title("Cluster Shape Map (PCA Projection)", fontweight="bold")
-    ax.set_xlabel("Principal Component 1")
-    ax.set_ylabel("Principal Component 2")
-    cbar = fig.colorbar(scatter, ax=ax, fraction=0.04, pad=0.02)
-    cbar.set_label("Cluster")
-    fig.tight_layout()
-    return fig_to_base64(fig)
-
-
-def cluster_timeline_img(labels: np.ndarray) -> str:
-    x = np.arange(len(labels))
-    fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(x, labels, linewidth=0.9, color="#243b53", alpha=0.75)
-    ax.scatter(x, labels, c=labels, cmap="tab20", s=9, alpha=0.9)
-    ax.set_title("Cluster Trend Across Draw Timeline (Oldest -> Newest)", fontweight="bold")
-    ax.set_xlabel("Draw Sequence Index")
-    ax.set_ylabel("Cluster ID")
-    ax.grid(alpha=0.22)
-    fig.tight_layout()
-    return fig_to_base64(fig)
-
-
-def cluster_profile_img(df: pd.DataFrame, labels: np.ndarray) -> str:
-    means = df[PRIMARY_COLS].assign(Cluster=labels).groupby("Cluster")[PRIMARY_COLS].mean().sort_index()
-    values = means.values
-    fig, ax = plt.subplots(figsize=(10, 5))
-    im = ax.imshow(values, aspect="auto", cmap="YlGnBu")
-    ax.set_xticks(np.arange(len(PRIMARY_COLS)))
-    ax.set_xticklabels(PRIMARY_COLS, rotation=25, ha="right")
-    ax.set_yticks(np.arange(len(means.index)))
-    ax.set_yticklabels([str(v) for v in means.index])
-    ax.set_title("Cluster Pattern Focus (Win_1..Win_6 + Addl No.)", fontweight="bold")
-    ax.set_xlabel("Key Number Columns")
-    ax.set_ylabel("Cluster")
-    for r in range(values.shape[0]):
-        for c in range(values.shape[1]):
-            ax.text(c, r, f"{values[r, c]:.1f}", ha="center", va="center", fontsize=8, color="#0b132b")
-    fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02, label="Mean")
-    fig.tight_layout()
-    return fig_to_base64(fig)
-
-
-def training_curve_img(history: keras.callbacks.History) -> str:
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(history.history.get("loss", []), label="train_loss", linewidth=1.6)
-    ax.plot(history.history.get("val_loss", []), label="val_loss", linewidth=1.6)
-    ax.set_title("Final Training Curve", fontweight="bold")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    ax.grid(alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    return fig_to_base64(fig)
-
-
-def tuning_curve_img(tuning_df: pd.DataFrame) -> str:
-    fig, ax = plt.subplots(figsize=(10, 4))
-    x = np.arange(len(tuning_df))
-    ax.plot(x, tuning_df["mean_val_hit_score"], marker="o", linewidth=1.2, color="#136f63")
-    for i, row in tuning_df.iterrows():
-        ax.text(i, row["mean_val_hit_score"], f"seq={int(row['seq_len'])}", fontsize=7, alpha=0.8)
-    ax.set_title("Hyperparameter Tuning Result (Higher Hit Score is Better)", fontweight="bold")
-    ax.set_xlabel("Trial Index")
-    ax.set_ylabel("Mean Validation Hit Score")
-    ax.grid(alpha=0.25)
-    fig.tight_layout()
-    return fig_to_base64(fig)
-
-
-def backtest_plot_img(backtest_df: pd.DataFrame) -> str:
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    axes[0].hist(backtest_df["win_hits"], bins=np.arange(-0.5, 7.5, 1), color="#2f6f6f", alpha=0.88, edgecolor="#f8f9fa")
-    axes[0].set_title("Backtest Win-Hit Distribution")
-    axes[0].set_xlabel("Matched Winning Numbers (0-6)")
-    axes[0].set_ylabel("Count")
-    axes[0].grid(alpha=0.2)
-
-    axes[1].plot(backtest_df.index.values, backtest_df["win_hits"], color="#1f4e79", linewidth=1.0, alpha=0.85)
-    rolling = backtest_df["win_hits"].rolling(20, min_periods=1).mean()
-    axes[1].plot(backtest_df.index.values, rolling, color="#d1495b", linewidth=1.8, label="rolling mean (20)")
-    axes[1].set_title("Backtest Hit Trend")
-    axes[1].set_xlabel("Backtest Sample Index")
-    axes[1].set_ylabel("Win Hits")
-    axes[1].grid(alpha=0.2)
-    axes[1].legend()
-
-    fig.tight_layout()
-    return fig_to_base64(fig)
 
 
 def build_sequences(X_weighted: np.ndarray, df: pd.DataFrame, seq_len: int, aux_cols: List[str]) -> Tuple[np.ndarray, Dict[str, np.ndarray], np.ndarray]:
@@ -1497,60 +1388,71 @@ def build_combined_distributions(
     pred: Dict[str, np.ndarray],
     win_cluster_prior: np.ndarray,
     graph_prior: np.ndarray | None,
+    embed_prior: np.ndarray | None,
     repel_prior: np.ndarray,
     weights: Dict[str, float],
     dynamic_blend: bool = True,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
-    win_soft_raw = normalize_prob(np.mean([pred[f"win_{i}"][0] for i in range(1, 7)], axis=0))
-    cluster_raw = normalize_prob(win_cluster_prior)
-    graph_raw = normalize_prob(graph_prior if graph_prior is not None else cluster_raw)
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float]:
+    uniform = np.ones(49, dtype=np.float64) / 49.0
+    graph_raw = normalize_prob(graph_prior if graph_prior is not None else uniform)
+    embed_raw = normalize_prob(embed_prior if embed_prior is not None else graph_raw)
+    cluster_raw = normalize_prob(win_cluster_prior if win_cluster_prior is not None else uniform)
     repel_raw = normalize_prob(repel_prior)
-    model_conf = float(np.max(win_soft_raw))
+
+    slot_probs: List[np.ndarray] = []
+    for i in range(1, 7):
+        key = f"win_{i}"
+        if key in pred and len(pred[key]) > 0:
+            slot_probs.append(normalize_prob(pred[key][0]))
+    if slot_probs:
+        slot_mean = normalize_prob(np.mean(np.stack(slot_probs, axis=0), axis=0))
+    else:
+        slot_mean = uniform
+    if "win_set" in pred and len(pred["win_set"]) > 0:
+        win_set_prob = normalize_prob(pred["win_set"][0])
+    else:
+        win_set_prob = slot_mean
+    model_soft_raw = normalize_prob(0.62 * win_set_prob + 0.38 * slot_mean)
+    model_conf = float(max(np.max(model_soft_raw), np.max(graph_raw), np.max(embed_raw), np.max(cluster_raw)))
 
     if dynamic_blend:
-        ent_soft = normalized_entropy(win_soft_raw)
-        ent_cluster = normalized_entropy(cluster_raw)
+        ent_model = normalized_entropy(model_soft_raw)
         ent_graph = normalized_entropy(graph_raw)
+        ent_embed = normalized_entropy(embed_raw)
+        ent_cluster = normalized_entropy(cluster_raw)
 
-        soft_prob = temperature_scale_prob(win_soft_raw, 0.90 + 0.90 * ent_soft)
-        cluster_prob = temperature_scale_prob(cluster_raw, 0.96 + 0.56 * ent_cluster)
-        graph_prob = temperature_scale_prob(graph_raw, 0.94 + 0.66 * ent_graph)
+        model_soft_prob = temperature_scale_prob(model_soft_raw, 0.88 + 0.84 * ent_model)
+        graph_prob = temperature_scale_prob(graph_raw, 0.92 + 0.76 * ent_graph)
+        embed_prob = temperature_scale_prob(embed_raw, 0.90 + 0.80 * ent_embed)
+        cluster_prob = temperature_scale_prob(cluster_raw, 0.94 + 0.74 * ent_cluster)
 
-        rel_soft = max(0.08, (1.0 - ent_soft) ** 1.75)
-        rel_cluster = max(0.10, (1.0 - ent_cluster) ** 1.28)
-        rel_graph = max(0.10, (1.0 - ent_graph) ** 1.36)
+        model_rel = max(0.10, (1.0 - ent_model) ** 1.30)
+        graph_rel = max(0.10, (1.0 - ent_graph) ** 1.34)
+        embed_rel = max(0.10, (1.0 - ent_embed) ** 1.30)
+        cluster_rel = max(0.10, (1.0 - ent_cluster) ** 1.25)
 
-        base_win_weights = {
-            "model_soft": float(weights.get("model_soft", 0.0)),
-            "cluster": float(weights.get("cluster", 0.0)),
-            "graph": float(weights.get("graph", 0.0)),
-        }
-        win_total = sum(base_win_weights.values()) + 1e-12
-        dyn_win = {
-            "model_soft": base_win_weights["model_soft"] * (0.30 + 0.70 * rel_soft),
-            "cluster": base_win_weights["cluster"] * (0.34 + 0.66 * rel_cluster),
-            "graph": base_win_weights["graph"] * (0.34 + 0.66 * rel_graph),
-        }
-        dyn_sum = sum(dyn_win.values()) + 1e-12
-        dyn_win = {k: float(v * (win_total / dyn_sum)) for k, v in dyn_win.items()}
-        avg_unc = float(np.mean([ent_soft, ent_cluster, ent_graph]))
-        repel_scale = 0.34 + 1.08 * avg_unc
+        model_weight = float(weights.get("model_soft", 0.0)) * (0.30 + 0.70 * model_rel)
+        graph_weight = float(weights.get("graph", 0.0)) * (0.30 + 0.70 * graph_rel)
+        embed_weight = float(weights.get("embed", 0.0)) * (0.30 + 0.70 * embed_rel)
+        cluster_weight = float(weights.get("cluster", 0.0)) * (0.30 + 0.70 * cluster_rel)
+        repel_scale = 0.26 + 1.06 * max(ent_model, ent_graph, ent_embed, ent_cluster)
     else:
-        soft_prob = win_soft_raw
-        cluster_prob = cluster_raw
+        model_soft_prob = model_soft_raw
         graph_prob = graph_raw
-        dyn_win = {
-            "model_soft": float(weights.get("model_soft", 0.0)),
-            "cluster": float(weights.get("cluster", 0.0)),
-            "graph": float(weights.get("graph", 0.0)),
-        }
-        repel_scale = 0.46 + 0.84 * (1.0 - model_conf)
+        embed_prob = embed_raw
+        cluster_prob = cluster_raw
+        model_weight = float(weights.get("model_soft", 0.0))
+        graph_weight = float(weights.get("graph", 0.0))
+        embed_weight = float(weights.get("embed", 0.0))
+        cluster_weight = float(weights.get("cluster", 0.0))
+        repel_scale = 0.44 + 0.92 * (1.0 - model_conf)
 
     combined_win = (
-        dyn_win["model_soft"] * soft_prob
-        + dyn_win["cluster"] * cluster_prob
-        + dyn_win["graph"] * graph_prob
-        - (float(weights["repel"]) * repel_scale) * repel_raw
+        model_weight * model_soft_prob
+        + graph_weight * graph_prob
+        + embed_weight * embed_prob
+        + cluster_weight * cluster_prob
+        - (float(weights.get("repel", 0.0)) * repel_scale) * repel_raw
     )
     combined_win = normalize_prob(np.clip(combined_win, 1e-12, None))
     sharpen_t = float(np.clip(0.84 + 0.34 * (1.0 - model_conf), 0.70, 1.20))
@@ -1564,9 +1466,8 @@ def build_combined_distributions(
     combined_addl = addl_model
     combined_addl = normalize_prob(np.clip(combined_addl, 1e-12, None))
 
-    cluster_prob = normalize_prob(win_cluster_prior)
     repel_prob = normalize_prob(repel_prior)
-    return combined_win, combined_addl, cluster_prob, repel_prob, model_conf
+    return combined_win, combined_addl, model_soft_prob, graph_prob, embed_prob, cluster_prob, repel_prob, model_conf
 
 
 def choose_addl_from_probs(combined_addl: np.ndarray, win_numbers: List[int]) -> int:
@@ -1585,46 +1486,258 @@ def choose_addl_from_probs(combined_addl: np.ndarray, win_numbers: List[int]) ->
 def candidate_utility_from_probs(
     nums: List[int],
     combined_win: np.ndarray,
-    cluster_prob: np.ndarray,
 ) -> float:
     idx = np.asarray(nums, dtype=np.int32) - 1
     p = np.clip(combined_win[idx], 1e-12, 1.0)
-    c = np.clip(cluster_prob[idx], 1e-12, 1.0)
     # Tail-hit mode prefers concentrated high-probability sets.
-    util = 2.7 * float(np.mean(np.log(p))) + 0.32 * float(np.mean(np.log(c)))
+    util = 2.9 * float(np.mean(np.log(p)))
     return float(util)
+
+
+def gumbel_topk_set(prob: np.ndarray, k: int, rng: np.random.Generator) -> List[int]:
+    p = normalize_prob(prob)
+    u = rng.uniform(1e-12, 1.0 - 1e-12, size=len(p))
+    g = -np.log(-np.log(u))
+    scores = np.log(np.clip(p, 1e-12, 1.0)) + g
+    idx = np.argpartition(scores, -k)[-k:]
+    return sorted((idx + 1).astype(int).tolist())
+
+
+def candidate_feature_vector(
+    nums: List[int],
+    combined_win: np.ndarray,
+    model_soft_prob: np.ndarray,
+    graph_prob: np.ndarray,
+    embed_prob: np.ndarray,
+    cluster_prob: np.ndarray,
+    repel_prob: np.ndarray,
+) -> np.ndarray:
+    arr = np.asarray(sorted(nums), dtype=np.int32)
+    idx = arr - 1
+    p = np.clip(combined_win[idx], 1e-12, 1.0)
+    logp = np.log(p)
+    gaps = np.diff(arr).astype(np.float64)
+    gap_mean = float(np.mean(gaps)) if len(gaps) > 0 else 0.0
+    gap_std = float(np.std(gaps)) if len(gaps) > 0 else 0.0
+    spread = float((arr[-1] - arr[0]) / 48.0) if len(arr) > 0 else 0.0
+    dense_ratio = float(np.mean(gaps <= 2.0)) if len(gaps) > 0 else 0.0
+    odd_balance = abs(float(np.sum(arr % 2 == 1)) - 3.0) / 3.0
+    low_balance = abs(float(np.sum(arr <= 24)) - 3.0) / 3.0
+    return np.asarray(
+        [
+            float(np.mean(logp)),
+            float(np.min(logp)),
+            float(np.max(logp)),
+            float(np.std(logp)),
+            float(np.mean(model_soft_prob[idx])),
+            float(np.mean(graph_prob[idx])),
+            float(np.mean(embed_prob[idx])),
+            float(np.mean(cluster_prob[idx])),
+            float(np.mean(repel_prob[idx])),
+            spread,
+            gap_mean / 8.0,
+            gap_std / 6.0,
+            dense_ratio,
+            odd_balance,
+            low_balance,
+        ],
+        dtype=np.float64,
+    )
+
+
+def candidate_expected_hit_signal(
+    nums: List[int],
+    combined_win: np.ndarray,
+    model_soft_prob: np.ndarray,
+    graph_prob: np.ndarray,
+    embed_prob: np.ndarray,
+    cluster_prob: np.ndarray,
+) -> Tuple[float, float]:
+    idx = np.asarray(sorted(nums), dtype=np.int32) - 1
+    exp_hit = float(np.sum(np.clip(combined_win[idx], 1e-12, 1.0)))
+    consensus = float(
+        0.25 * np.mean(model_soft_prob[idx])
+        + 0.25 * np.mean(graph_prob[idx])
+        + 0.25 * np.mean(embed_prob[idx])
+        + 0.25 * np.mean(cluster_prob[idx])
+    )
+    return exp_hit, consensus
+
+
+def generate_candidate_sets(
+    combined_win: np.ndarray,
+    candidate_gumbel_samples: int = 28,
+    candidate_max_pool: int = 48,
+    rng: np.random.Generator | None = None,
+) -> List[List[int]]:
+    if rng is None:
+        top_idx = np.argsort(combined_win)[-8:].astype(np.int64)
+        top_p = np.round(combined_win[top_idx] * 1e6).astype(np.int64)
+        seed_hint = int(np.dot(top_idx + 1, np.arange(1, len(top_idx) + 1, dtype=np.int64)) + np.sum(top_p))
+        rng = np.random.default_rng(ACTIVE_SEED + 131 + (seed_hint % 1000003))
+    cands: List[List[int]] = []
+    cands.append(sorted([int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()]))
+    cands.append(select_win_numbers_with_repulsion(combined_win, count=6, p1=0.93, p2=0.97, p3=0.985))
+    cands.append(select_win_numbers_with_repulsion(combined_win, count=6, p1=0.88, p2=0.94, p3=0.97))
+    cands.append(select_win_numbers_with_repulsion(combined_win, count=6, p1=0.83, p2=0.90, p3=0.95))
+    for temp in (0.78, 0.88, 1.05, 1.22):
+        tprob = temperature_scale_prob(combined_win, temperature=temp)
+        cands.append(sorted([int(i + 1) for i in np.argsort(tprob)[-6:].tolist()]))
+    for _ in range(max(0, int(candidate_gumbel_samples))):
+        cands.append(gumbel_topk_set(combined_win, k=6, rng=rng))
+
+    out: List[List[int]] = []
+    seen: set[Tuple[int, ...]] = set()
+    for c in cands:
+        key = tuple(sorted(int(x) for x in c))
+        if len(key) != 6:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(list(key))
+        if len(out) >= max(6, int(candidate_max_pool)):
+            break
+    return out
+
+
+def repetition_penalty_score(
+    key: Tuple[int, ...],
+    recent_pred_sets: List[Tuple[int, ...]] | None,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
+) -> float:
+    if not recent_pred_sets:
+        return 0.0
+    window = int(max(1, anti_repeat_window))
+    lam = float(max(0.0, anti_repeat_lambda))
+    if lam <= 0.0:
+        return 0.0
+
+    key_set = set(int(x) for x in key)
+    hist = recent_pred_sets[-window:]
+    penalty = 0.0
+    num_freq = np.zeros(49, dtype=np.float64)
+    for rank, prev in enumerate(reversed(hist), start=1):
+        decay = 1.0 / math.sqrt(float(rank))
+        prev_set = set(int(x) for x in prev)
+        overlap_n = len(key_set.intersection(prev_set))
+        overlap = overlap_n / 6.0
+        for n in prev_set:
+            num_freq[int(n) - 1] += decay
+        if key == prev:
+            penalty += 2.20 * decay
+        elif overlap_n >= 5:
+            penalty += (1.45 + 0.35 * overlap_n) * decay
+        elif overlap_n == 4:
+            penalty += 1.65 * decay
+        elif overlap_n == 3:
+            penalty += 0.62 * decay
+        elif overlap_n == 2:
+            penalty += 0.18 * decay
+        else:
+            penalty += 0.06 * max(0.0, overlap - (1.0 / 6.0)) * decay
+
+    idx = np.asarray([int(x) - 1 for x in key], dtype=np.int32)
+    freq_norm = num_freq / (float(np.max(num_freq)) + 1e-12)
+    num_pen = 0.42 * float(np.mean(freq_norm[idx]))
+    penalty += num_pen
+    return lam * penalty
 
 
 def combine_prediction(
     pred: Dict[str, np.ndarray],
     win_cluster_prior: np.ndarray,
     graph_prior: np.ndarray | None,
+    embed_prior: np.ndarray | None,
     repel_prior: np.ndarray,
     weights: Dict[str, float],
     dynamic_blend: bool = True,
+    reward_reranker: RewardReranker | None = None,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+    expected_hit_rerank: bool = True,
+    expected_hit_lambda: float = 2.20,
+    expected_hit_synergy_lambda: float = 0.48,
+    recent_pred_sets: List[Tuple[int, ...]] | None = None,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
+    rng: np.random.Generator | None = None,
 ) -> Tuple[List[int], int]:
-    combined_win, combined_addl, cluster_prob, repel_prob, model_conf = build_combined_distributions(
+    combined_win, combined_addl, model_soft_prob, graph_prob, embed_prob, cluster_prob, repel_prob, model_conf = build_combined_distributions(
         pred=pred,
         win_cluster_prior=win_cluster_prior,
         graph_prior=graph_prior,
+        embed_prior=embed_prior,
         repel_prior=repel_prior,
         weights=weights,
         dynamic_blend=dynamic_blend,
     )
 
-    plain_top = sorted([int(i + 1) for i in np.argsort(combined_win)[-6:].tolist()])
-    repel_light = select_win_numbers_with_repulsion(combined_win, count=6, p1=0.93, p2=0.97, p3=0.985)
-    repel_std = select_win_numbers_with_repulsion(combined_win, count=6, p1=0.88, p2=0.94, p3=0.97)
-
-    candidates: Dict[Tuple[int, ...], float] = {}
-    for cand in (plain_top, repel_light, repel_std):
+    candidates = generate_candidate_sets(
+        combined_win=combined_win,
+        candidate_gumbel_samples=candidate_gumbel_samples,
+        candidate_max_pool=candidate_max_pool,
+        rng=rng,
+    )
+    scores: Dict[Tuple[int, ...], float] = {}
+    for cand in candidates:
         key = tuple(sorted(cand))
-        candidates[key] = candidate_utility_from_probs(list(key), combined_win=combined_win, cluster_prob=cluster_prob)
-    if model_conf >= 0.28:
-        candidates[tuple(plain_top)] += 0.06
-    else:
-        candidates[tuple(repel_light)] += 0.03
-    best_key = max(candidates.items(), key=lambda kv: kv[1])[0]
+        base_score = candidate_utility_from_probs(list(key), combined_win=combined_win)
+        arr = np.asarray(key, dtype=np.int32)
+        spread = float((arr[-1] - arr[0]) / 48.0)
+        diversity_pen = float(candidate_diversity_lambda) * (1.0 - spread)
+        score = base_score - diversity_pen
+        score -= repetition_penalty_score(
+            key=key,
+            recent_pred_sets=recent_pred_sets,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
+        )
+        if bool(expected_hit_rerank):
+            exp_hit, consensus = candidate_expected_hit_signal(
+                nums=list(key),
+                combined_win=combined_win,
+                model_soft_prob=model_soft_prob,
+                graph_prob=graph_prob,
+                embed_prob=embed_prob,
+                cluster_prob=cluster_prob,
+            )
+            score += float(expected_hit_lambda) * exp_hit
+            score += float(expected_hit_synergy_lambda) * consensus
+        if reward_reranker is not None:
+            feat = candidate_feature_vector(
+                nums=list(key),
+                combined_win=combined_win,
+                model_soft_prob=model_soft_prob,
+                graph_prob=graph_prob,
+                embed_prob=embed_prob,
+                cluster_prob=cluster_prob,
+                repel_prob=repel_prob,
+            )
+            score += float(reward_reranker.reward_scale) * reward_reranker.score(feat)
+        scores[key] = score
+    if candidates:
+        plain_top = tuple(sorted(candidates[0]))
+        if model_conf >= 0.28:
+            scores[plain_top] = scores.get(plain_top, 0.0) + 0.06
+
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_key = ranked[0][0]
+    if recent_pred_sets:
+        hist = recent_pred_sets[-max(1, int(anti_repeat_window)) :]
+        last_set = set(int(x) for x in hist[-1])
+        strict_mode = float(anti_repeat_lambda) >= 0.60
+        max_last_overlap = 2 if strict_mode else 3
+        max_hist_overlap = 3 if strict_mode else 4
+        for key, _sc in ranked:
+            s = set(int(x) for x in key)
+            overlap_last = len(s.intersection(last_set))
+            max_overlap_hist = max(len(s.intersection(set(int(y) for y in prev))) for prev in hist)
+            if overlap_last <= max_last_overlap and max_overlap_hist <= max_hist_overlap:
+                best_key = key
+                break
     win_numbers = list(best_key)
     addl_number = choose_addl_from_probs(combined_addl, win_numbers)
     return win_numbers, addl_number
@@ -1707,6 +1820,44 @@ def sharpen_recency_weights(weights: np.ndarray, power: float = 1.35, floor: flo
     return w.astype(np.float32)
 
 
+def emphasize_latest_weights(
+    weights: np.ndarray,
+    latest_n: int = 5,
+    boost: float = 3.4,
+    power: float = 1.9,
+) -> np.ndarray:
+    """
+    Increase optimization pressure on the most recent samples.
+    """
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if len(w) == 0:
+        return w.astype(np.float32)
+    latest_n = int(max(0, latest_n))
+    boost = float(max(1.0, boost))
+    if latest_n <= 0 or boost <= 1.0:
+        return w.astype(np.float32)
+    tail = int(min(latest_n, len(w)))
+    start = int(len(w) - tail)
+    ramp = np.linspace(0.35, 1.0, tail, dtype=np.float64)
+    ramp = np.power(ramp, max(1.0, float(power)))
+    out = w.copy()
+    out[start:] *= 1.0 + (boost - 1.0) * ramp
+    out = np.clip(out, 1e-8, None)
+    out = out / (float(np.mean(out)) + 1e-12)
+    return out.astype(np.float32)
+
+
+def empty_hit_metrics() -> Dict[str, float]:
+    return {
+        "avg_win_hits": 0.0,
+        "p_hit_ge2": 0.0,
+        "p_hit_ge3": 0.0,
+        "p_hit_ge4": 0.0,
+        "addl_acc": 0.0,
+        "hit_score": 0.0,
+    }
+
+
 def evaluate_hit_score(
     model: keras.Model,
     scaler_x: StandardScaler,
@@ -1716,12 +1867,22 @@ def evaluate_hit_score(
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
     graph_prior_matrix: np.ndarray,
+    embed_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     weights: Dict[str, float],
     sample_weights: np.ndarray | None = None,
     cached_preds: Dict[str, np.ndarray] | None = None,
     dynamic_blend: bool = True,
+    reward_reranker: RewardReranker | None = None,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+    expected_hit_rerank: bool = True,
+    expected_hit_lambda: float = 2.20,
+    expected_hit_synergy_lambda: float = 0.48,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
 ) -> Dict[str, float]:
     if len(eval_idx) == 0:
         return {
@@ -1744,6 +1905,7 @@ def evaluate_hit_score(
 
     win_hits: List[int] = []
     addl_hits: List[int] = []
+    recent_pred_sets: List[Tuple[int, ...]] = []
     for local_i, seq_i in enumerate(eval_idx):
         target_row = int(target_rows[seq_i])
         pred_pack = {k: v[local_i : local_i + 1] for k, v in preds.items()}
@@ -1752,10 +1914,22 @@ def evaluate_hit_score(
             pred=pred_pack,
             win_cluster_prior=win_cluster_prior_matrix[target_row],
             graph_prior=graph_prior_matrix[target_row],
+            embed_prior=embed_prior_matrix[target_row],
             repel_prior=repel_prior_matrix[target_row],
             weights=weights,
             dynamic_blend=dynamic_blend,
+            reward_reranker=reward_reranker,
+            candidate_max_pool=candidate_max_pool,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_diversity_lambda=candidate_diversity_lambda,
+            expected_hit_rerank=expected_hit_rerank,
+            expected_hit_lambda=expected_hit_lambda,
+            expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+            recent_pred_sets=recent_pred_sets,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
         )
+        recent_pred_sets.append(tuple(sorted(int(x) for x in pred_win)))
         actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
         actual_addl = int(df.loc[target_row, "Addl No."])
         h, a = summarize_hits(pred_win, pred_addl, actual_win, actual_addl)
@@ -1809,6 +1983,159 @@ def hit_metrics_from_arrays(
     }
 
 
+def build_near_miss_variants(
+    base_set: List[int],
+    combined_win: np.ndarray,
+    n_variants: int = 6,
+) -> List[List[int]]:
+    base = sorted(int(x) for x in base_set)
+    pool = [int(i + 1) for i in np.argsort(combined_win)[::-1].tolist()]
+    out: List[List[int]] = []
+    if len(base) != 6:
+        return out
+    cursor = 0
+    for replace_pos in range(6):
+        trial = base.copy()
+        while cursor < len(pool):
+            cand = int(pool[cursor])
+            cursor += 1
+            if cand in trial:
+                continue
+            trial2 = trial.copy()
+            trial2[replace_pos] = cand
+            key = sorted(set(trial2))
+            if len(key) == 6:
+                out.append(key)
+                break
+        if len(out) >= max(1, int(n_variants)):
+            break
+    return out
+
+
+def fit_reward_reranker(
+    model: keras.Model,
+    scaler_x: StandardScaler,
+    X_seq: np.ndarray,
+    eval_idx: np.ndarray,
+    target_rows: np.ndarray,
+    df: pd.DataFrame,
+    win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
+    embed_prior_matrix: np.ndarray,
+    repel_prior_matrix: np.ndarray,
+    blend_weights: Dict[str, float],
+    dynamic_blend: bool = True,
+    reward_a: float = 1.0,
+    reward_b: float = 2.4,
+    reward_c: float = 6.8,
+    reward_window: int = 72,
+    hardneg_boost: float = 0.9,
+    ridge: float = 0.18,
+    reward_scale: float = 0.55,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+) -> RewardReranker | None:
+    if len(eval_idx) <= 0:
+        return None
+    eval_use = np.asarray(eval_idx, dtype=np.int32)
+    if int(reward_window) > 0 and len(eval_use) > int(reward_window):
+        eval_use = eval_use[-int(reward_window) :]
+    if len(eval_use) <= 0:
+        return None
+
+    n_features = X_seq.shape[-1]
+    X_eval = scaler_x.transform(X_seq[eval_use].reshape(-1, n_features)).reshape(
+        len(eval_use), X_seq.shape[1], n_features
+    ).astype(np.float32)
+    preds = predict_outputs_dict(model, X_eval)
+    rng = np.random.default_rng(ACTIVE_SEED + 991)
+
+    feats: List[np.ndarray] = []
+    rewards: List[float] = []
+    sample_w: List[float] = []
+    for local_i, seq_i in enumerate(eval_use):
+        target_row = int(target_rows[int(seq_i)])
+        pred_pack = {k: v[local_i : local_i + 1] for k, v in preds.items()}
+        actual_set = set(df.loc[target_row, WIN_COLS].astype(int).tolist())
+        combined_win, _combined_addl, model_soft_prob, graph_prob, embed_prob, cluster_prob, repel_prob, _mconf = build_combined_distributions(
+            pred=pred_pack,
+            win_cluster_prior=win_cluster_prior_matrix[target_row],
+            graph_prior=graph_prior_matrix[target_row],
+            embed_prior=embed_prior_matrix[target_row],
+            repel_prior=repel_prior_matrix[target_row],
+            weights=blend_weights,
+            dynamic_blend=dynamic_blend,
+        )
+        cands = generate_candidate_sets(
+            combined_win=combined_win,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_max_pool=candidate_max_pool,
+            rng=rng,
+        )
+        if not cands:
+            continue
+        cands.extend(build_near_miss_variants(cands[0], combined_win=combined_win, n_variants=6))
+        seen: set[Tuple[int, ...]] = set()
+        for cand in cands:
+            key = tuple(sorted(int(x) for x in cand))
+            if key in seen or len(key) != 6:
+                continue
+            seen.add(key)
+            hits = len(set(key).intersection(actual_set))
+            reward = float(reward_a) * float(hits)
+            if hits >= 3:
+                reward += float(reward_b)
+            if hits >= 4:
+                reward += float(reward_c)
+            arr = np.asarray(key, dtype=np.int32)
+            spread = float((arr[-1] - arr[0]) / 48.0)
+            reward -= float(candidate_diversity_lambda) * max(0.0, 0.55 - spread)
+            feat = candidate_feature_vector(
+                nums=list(key),
+                combined_win=combined_win,
+                model_soft_prob=model_soft_prob,
+                graph_prob=graph_prob,
+                embed_prob=embed_prob,
+                cluster_prob=cluster_prob,
+                repel_prob=repel_prob,
+            )
+            w = 1.0
+            if hits in (1, 2):
+                w += float(max(0.0, hardneg_boost))
+            feats.append(feat)
+            rewards.append(float(reward))
+            sample_w.append(float(w))
+
+    if len(feats) < 16:
+        return None
+    X = np.asarray(feats, dtype=np.float64)
+    y = np.asarray(rewards, dtype=np.float64)
+    w = np.asarray(sample_w, dtype=np.float64)
+    w = np.clip(w, 1e-8, None)
+    w = w / (float(np.mean(w)) + 1e-12)
+
+    mu = np.mean(X, axis=0)
+    sd = np.std(X, axis=0) + 1e-6
+    Xn = (X - mu) / sd
+    XtW = Xn.T * w
+    reg = float(max(1e-6, ridge))
+    A = XtW @ Xn + reg * np.eye(Xn.shape[1], dtype=np.float64)
+    b = XtW @ y
+    try:
+        coef = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        coef = np.linalg.pinv(A) @ b
+    intercept = float(np.dot(w, (y - Xn @ coef)) / (float(np.sum(w)) + 1e-12))
+    return RewardReranker(
+        feature_mean=mu.astype(np.float64),
+        feature_std=sd.astype(np.float64),
+        coef=coef.astype(np.float64),
+        intercept=float(intercept),
+        reward_scale=float(np.clip(reward_scale, 0.05, 3.0)),
+    )
+
+
 def generate_trial_configs(num_trials: int) -> List[ModelConfig]:
     # Anchor from best observed run: log_01_s42_A (avg_win_hits=1.7000).
     anchor = ModelConfig(seq_len=24, lstm_units=128, gru_units=64, dense_units=160, dropout=0.2, lr=3e-4)
@@ -1856,16 +2183,10 @@ def generate_blend_candidates(base: Dict[str, float]) -> List[Dict[str, float]]:
     cands.append(normalize_blend_groups(dict(base), win_total=win_total, addl_total=addl_total))
 
     variants = [
-        # model-heavy
-        {"model_soft": 1.10, "cluster": 0.22, "graph": 0.36, "repel": 0.04, "addl_model": 1.00},
-        # cluster-heavy
-        {"model_soft": 0.34, "cluster": 1.02, "graph": 0.82, "repel": 0.08, "addl_model": 1.00},
-        # balanced
-        {"model_soft": 0.62, "cluster": 0.58, "graph": 0.62, "repel": 0.07, "addl_model": 1.00},
-        # low repel
-        {"model_soft": 0.54, "cluster": 0.70, "graph": 0.56, "repel": 0.02, "addl_model": 1.00},
-        # high cluster + repel guard
-        {"model_soft": 0.40, "cluster": 0.96, "graph": 0.86, "repel": 0.12, "addl_model": 1.00},
+        {"model_soft": 0.56, "graph": 0.92, "embed": 0.44, "cluster": 0.66, "repel": 0.00, "addl_model": 1.00},
+        {"model_soft": 0.76, "graph": 0.82, "embed": 0.58, "cluster": 0.60, "repel": 0.03, "addl_model": 1.00},
+        {"model_soft": 0.92, "graph": 0.62, "embed": 0.78, "cluster": 0.48, "repel": 0.07, "addl_model": 1.00},
+        {"model_soft": 0.68, "graph": 1.00, "embed": 0.25, "cluster": 0.72, "repel": 0.12, "addl_model": 1.00},
     ]
     for v in variants:
         cands.append(normalize_blend_groups(dict(v), win_total=win_total, addl_total=addl_total))
@@ -2285,6 +2606,7 @@ def run_tuning(
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
     graph_prior_matrix: np.ndarray,
+    embed_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     blend_weights: Dict[str, float],
@@ -2297,6 +2619,14 @@ def run_tuning(
     cache_dataset: bool = False,
     train_recency_weighted: bool = False,
     dynamic_blend: bool = True,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+    expected_hit_rerank: bool = True,
+    expected_hit_lambda: float = 2.20,
+    expected_hit_synergy_lambda: float = 0.48,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
 ) -> pd.DataFrame:
     rows: List[Dict[str, float]] = []
     for trial_idx, cfg in enumerate(trial_configs, start=1):
@@ -2365,11 +2695,20 @@ def run_tuning(
                     df=df,
                     win_cluster_prior_matrix=win_cluster_prior_matrix,
                     graph_prior_matrix=graph_prior_matrix,
+                    embed_prior_matrix=embed_prior_matrix,
                     addl_cluster_prior_matrix=addl_cluster_prior_matrix,
                     repel_prior_matrix=repel_prior_matrix,
                     weights=blend_weights,
                     sample_weights=eval_weights,
                     dynamic_blend=dynamic_blend,
+                    candidate_max_pool=candidate_max_pool,
+                    candidate_gumbel_samples=candidate_gumbel_samples,
+                    candidate_diversity_lambda=candidate_diversity_lambda,
+                    expected_hit_rerank=expected_hit_rerank,
+                    expected_hit_lambda=expected_hit_lambda,
+                    expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+                    anti_repeat_window=anti_repeat_window,
+                    anti_repeat_lambda=anti_repeat_lambda,
                 )
                 fold_hit_scores.append(hit_metrics["hit_score"])
                 fold_avg_hits.append(hit_metrics["avg_win_hits"])
@@ -2405,10 +2744,19 @@ def run_tuning(
                     df=df,
                     win_cluster_prior_matrix=win_cluster_prior_matrix,
                     graph_prior_matrix=graph_prior_matrix,
+                    embed_prior_matrix=embed_prior_matrix,
                     addl_cluster_prior_matrix=addl_cluster_prior_matrix,
                     repel_prior_matrix=repel_prior_matrix,
                     weights=blend_weights,
                     dynamic_blend=dynamic_blend,
+                    candidate_max_pool=candidate_max_pool,
+                    candidate_gumbel_samples=candidate_gumbel_samples,
+                    candidate_diversity_lambda=candidate_diversity_lambda,
+                    expected_hit_rerank=expected_hit_rerank,
+                    expected_hit_lambda=expected_hit_lambda,
+                    expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+                    anti_repeat_window=anti_repeat_window,
+                    anti_repeat_lambda=anti_repeat_lambda,
                 )
                 fold_hit_scores.append(hit_metrics["hit_score"])
                 fold_avg_hits.append(hit_metrics["avg_win_hits"])
@@ -2469,6 +2817,162 @@ def run_tuning(
     return result_df
 
 
+def model_config_key(cfg: ModelConfig) -> Tuple[int, int, int, int, float, float]:
+    return (
+        int(cfg.seq_len),
+        int(cfg.lstm_units),
+        int(cfg.gru_units),
+        int(cfg.dense_units),
+        float(cfg.dropout),
+        float(cfg.lr),
+    )
+
+
+def run_tuning_multifidelity(
+    trial_configs: List[ModelConfig],
+    seq_cache: Dict[int, Tuple[np.ndarray, Dict[str, np.ndarray], np.ndarray]],
+    df: pd.DataFrame,
+    win_cluster_prior_matrix: np.ndarray,
+    graph_prior_matrix: np.ndarray,
+    embed_prior_matrix: np.ndarray,
+    addl_cluster_prior_matrix: np.ndarray,
+    repel_prior_matrix: np.ndarray,
+    blend_weights: Dict[str, float],
+    tune_folds: int,
+    tune_epochs: int,
+    focus_last_n: int,
+    batch_size: int,
+    hit_score_focused: bool = False,
+    steps_per_execution: int = 0,
+    cache_dataset: bool = False,
+    train_recency_weighted: bool = False,
+    dynamic_blend: bool = True,
+    enable_multifidelity: bool = True,
+    stage1_epochs: int = 5,
+    keep_ratio: float = 0.45,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+    expected_hit_rerank: bool = True,
+    expected_hit_lambda: float = 2.20,
+    expected_hit_synergy_lambda: float = 0.48,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
+) -> pd.DataFrame:
+    if (not enable_multifidelity) or len(trial_configs) <= 3:
+        return run_tuning(
+            trial_configs=trial_configs,
+            seq_cache=seq_cache,
+            df=df,
+            win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
+            addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+            repel_prior_matrix=repel_prior_matrix,
+            blend_weights=blend_weights,
+            tune_folds=tune_folds,
+            tune_epochs=tune_epochs,
+            focus_last_n=focus_last_n,
+            batch_size=batch_size,
+            hit_score_focused=hit_score_focused,
+            steps_per_execution=steps_per_execution,
+            cache_dataset=cache_dataset,
+            train_recency_weighted=train_recency_weighted,
+            dynamic_blend=dynamic_blend,
+            candidate_max_pool=candidate_max_pool,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_diversity_lambda=candidate_diversity_lambda,
+            expected_hit_rerank=expected_hit_rerank,
+            expected_hit_lambda=expected_hit_lambda,
+            expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
+        )
+
+    s1_epochs = int(max(1, min(int(stage1_epochs), int(max(1, tune_epochs)))))
+    s1_folds = int(np.clip(tune_folds, 1, 2))
+    print(
+        f"[TUNE-MF] stage1: trials={len(trial_configs)} folds={s1_folds} epochs={s1_epochs}; "
+        f"stage2 epochs={tune_epochs}"
+    )
+    stage1 = run_tuning(
+        trial_configs=trial_configs,
+        seq_cache=seq_cache,
+        df=df,
+        win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
+        embed_prior_matrix=embed_prior_matrix,
+        addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+        repel_prior_matrix=repel_prior_matrix,
+        blend_weights=blend_weights,
+        tune_folds=s1_folds,
+        tune_epochs=s1_epochs,
+        focus_last_n=focus_last_n,
+        batch_size=batch_size,
+        hit_score_focused=hit_score_focused,
+        steps_per_execution=steps_per_execution,
+        cache_dataset=cache_dataset,
+        train_recency_weighted=train_recency_weighted,
+        dynamic_blend=dynamic_blend,
+        candidate_max_pool=candidate_max_pool,
+        candidate_gumbel_samples=candidate_gumbel_samples,
+        candidate_diversity_lambda=candidate_diversity_lambda,
+        expected_hit_rerank=expected_hit_rerank,
+        expected_hit_lambda=expected_hit_lambda,
+        expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+        anti_repeat_window=anti_repeat_window,
+        anti_repeat_lambda=anti_repeat_lambda,
+    )
+    if stage1.empty:
+        return stage1
+
+    keep_n = int(max(2, min(len(stage1), math.ceil(len(stage1) * float(np.clip(keep_ratio, 0.15, 0.9))))))
+    top = stage1.head(keep_n)
+    keep_keys = set(
+        (
+            int(r.seq_len),
+            int(r.lstm_units),
+            int(r.gru_units),
+            int(r.dense_units),
+            float(r.dropout),
+            float(r.lr),
+        )
+        for r in top.itertuples(index=False)
+    )
+    shortlisted = [cfg for cfg in trial_configs if model_config_key(cfg) in keep_keys]
+    if len(shortlisted) <= 0:
+        shortlisted = trial_configs[: keep_n]
+    print(f"[TUNE-MF] stage2 shortlisted {len(shortlisted)}/{len(trial_configs)} configs")
+    return run_tuning(
+        trial_configs=shortlisted,
+        seq_cache=seq_cache,
+        df=df,
+        win_cluster_prior_matrix=win_cluster_prior_matrix,
+        graph_prior_matrix=graph_prior_matrix,
+        embed_prior_matrix=embed_prior_matrix,
+        addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+        repel_prior_matrix=repel_prior_matrix,
+        blend_weights=blend_weights,
+        tune_folds=tune_folds,
+        tune_epochs=tune_epochs,
+        focus_last_n=focus_last_n,
+        batch_size=batch_size,
+        hit_score_focused=hit_score_focused,
+        steps_per_execution=steps_per_execution,
+        cache_dataset=cache_dataset,
+        train_recency_weighted=train_recency_weighted,
+        dynamic_blend=dynamic_blend,
+        candidate_max_pool=candidate_max_pool,
+        candidate_gumbel_samples=candidate_gumbel_samples,
+        candidate_diversity_lambda=candidate_diversity_lambda,
+        expected_hit_rerank=expected_hit_rerank,
+        expected_hit_lambda=expected_hit_lambda,
+        expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+        anti_repeat_window=anti_repeat_window,
+        anti_repeat_lambda=anti_repeat_lambda,
+    )
+
+
 def calibrate_blend_weights_by_component_performance(
     model: keras.Model,
     scaler_x: StandardScaler,
@@ -2478,12 +2982,21 @@ def calibrate_blend_weights_by_component_performance(
     df: pd.DataFrame,
     win_cluster_prior_matrix: np.ndarray,
     graph_prior_matrix: np.ndarray,
+    embed_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     base_weights: Dict[str, float],
     sample_weights: np.ndarray | None = None,
     cached_preds: Dict[str, np.ndarray] | None = None,
     dynamic_blend: bool = True,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+    expected_hit_rerank: bool = True,
+    expected_hit_lambda: float = 2.20,
+    expected_hit_synergy_lambda: float = 0.48,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
 ) -> Tuple[Dict[str, float], pd.DataFrame]:
     win_keys = list(WIN_BLEND_KEYS)
     addl_keys = list(ADDL_BLEND_KEYS)
@@ -2504,12 +3017,21 @@ def calibrate_blend_weights_by_component_performance(
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
             graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=w,
             sample_weights=sample_weights,
             cached_preds=cached_preds,
             dynamic_blend=dynamic_blend,
+            candidate_max_pool=candidate_max_pool,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_diversity_lambda=candidate_diversity_lambda,
+            expected_hit_rerank=expected_hit_rerank,
+            expected_hit_lambda=expected_hit_lambda,
+            expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
         )
         score = (
             320.0 * metrics["p_hit_ge4"]
@@ -2535,9 +3057,8 @@ def calibrate_blend_weights_by_component_performance(
     addl_scores: List[float] = []
     for key in addl_keys:
         w = {k: 0.0 for k in base_weights.keys()}
-        w["model_soft"] = 0.30
-        w["cluster"] = 0.15
-        w["graph"] = 0.55
+        for wk in win_keys:
+            w[wk] = float(base_weights.get(wk, 0.0))
         w[key] = 1.0
         metrics = evaluate_hit_score(
             model=model,
@@ -2548,12 +3069,21 @@ def calibrate_blend_weights_by_component_performance(
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
             graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=w,
             sample_weights=sample_weights,
             cached_preds=cached_preds,
             dynamic_blend=dynamic_blend,
+            candidate_max_pool=candidate_max_pool,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_diversity_lambda=candidate_diversity_lambda,
+            expected_hit_rerank=expected_hit_rerank,
+            expected_hit_lambda=expected_hit_lambda,
+            expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
         )
         score = 28.0 * metrics["addl_acc"] + 2.0 * metrics["avg_win_hits"] + 18.0 * metrics["p_hit_ge2"]
         addl_scores.append(float(score))
@@ -2596,12 +3126,21 @@ def calibrate_blend_weights_by_component_performance(
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
             graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=w,
             sample_weights=sample_weights,
             cached_preds=cached_preds,
             dynamic_blend=dynamic_blend,
+            candidate_max_pool=candidate_max_pool,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_diversity_lambda=candidate_diversity_lambda,
+            expected_hit_rerank=expected_hit_rerank,
+            expected_hit_lambda=expected_hit_lambda,
+            expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
         )
         score = blend_objective(metrics, focused=False)
         if score > best_repel_score:
@@ -2623,12 +3162,17 @@ def run_backtest(
     target_rows: np.ndarray,
     win_cluster_prior_matrix: np.ndarray,
     graph_prior_matrix: np.ndarray,
+    embed_prior_matrix: np.ndarray,
     addl_cluster_prior_matrix: np.ndarray,
     repel_prior_matrix: np.ndarray,
     blend_weights: Dict[str, float],
     backtest_folds: int,
     backtest_epochs: int,
     focus_last_n: int,
+    latest_priority_n: int,
+    latest_priority_boost: float,
+    latest_priority_lambda: float,
+    latest_priority_addl_lambda: float,
     batch_size: int,
     local_random_candidates: int,
     optimize_avg: bool,
@@ -2638,110 +3182,214 @@ def run_backtest(
     cache_dataset: bool = False,
     train_recency_weighted: bool = False,
     dynamic_blend: bool = True,
+    reward_reranker: RewardReranker | None = None,
+    candidate_max_pool: int = 48,
+    candidate_gumbel_samples: int = 28,
+    candidate_diversity_lambda: float = 0.11,
+    expected_hit_rerank: bool = True,
+    expected_hit_lambda: float = 2.20,
+    expected_hit_synergy_lambda: float = 0.48,
+    anti_repeat_window: int = 10,
+    anti_repeat_lambda: float = 1.25,
+    no_retrain: bool = False,
+    inference_model: keras.Model | None = None,
+    inference_scaler: StandardScaler | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     n_samples = len(X_seq)
     records: List[Dict[str, object]] = []
+
+    def _row_draw(target_row: int) -> object:
+        v = df.loc[target_row, "Draw"]
+        return int(v) if not pd.isna(v) else ""
+
+    def _row_date(target_row: int) -> str:
+        v = df.loc[target_row, "Date"]
+        return v.strftime("%Y-%m-%d") if not pd.isna(v) else ""
+
+    def _actual_values(target_row: int) -> Tuple[List[int], int]:
+        actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
+        actual_addl = int(df.loc[target_row, "Addl No."])
+        return actual_win, actual_addl
+
+    def _cluster_state(target_row: int) -> Tuple[int, int]:
+        hist_labels = cluster_labels[:target_row]
+        if len(hist_labels) > 1:
+            _tm, last_cluster, next_cluster = transition_from_labels(hist_labels, best_k)
+            return int(last_cluster), int(next_cluster)
+        fallback = int(cluster_labels[max(0, target_row - 1)])
+        return fallback, fallback
+
+    def _build_payload(fold: int, target_row: int, pred_pack: Dict[str, np.ndarray]) -> Dict[str, object]:
+        last_cluster, next_cluster = _cluster_state(target_row)
+        actual_win, actual_addl = _actual_values(target_row)
+        return {
+            "fold": fold,
+            "target_row": target_row,
+            "draw": _row_draw(target_row),
+            "date": _row_date(target_row),
+            "cluster_last": last_cluster,
+            "cluster_pred_next": next_cluster,
+            "pred_pack": pred_pack,
+            "win_cluster_prior": win_cluster_prior_matrix[target_row],
+            "graph_prior": graph_prior_matrix[target_row],
+            "embed_prior": embed_prior_matrix[target_row],
+            "repel_prior": repel_prior_matrix[target_row],
+            "actual_win": actual_win,
+            "actual_addl": actual_addl,
+        }
+
+    def _predict_for_target_row(
+        pred_pack: Dict[str, np.ndarray],
+        target_row: int,
+        weights: Dict[str, float],
+        recent_pred_sets: List[Tuple[int, ...]] | None = None,
+    ) -> Tuple[List[int], int]:
+        return combine_prediction(
+            pred=pred_pack,
+            win_cluster_prior=win_cluster_prior_matrix[target_row],
+            graph_prior=graph_prior_matrix[target_row],
+            embed_prior=embed_prior_matrix[target_row],
+            repel_prior=repel_prior_matrix[target_row],
+            weights=weights,
+            dynamic_blend=dynamic_blend,
+            reward_reranker=reward_reranker,
+            candidate_max_pool=candidate_max_pool,
+            candidate_gumbel_samples=candidate_gumbel_samples,
+            candidate_diversity_lambda=candidate_diversity_lambda,
+            expected_hit_rerank=expected_hit_rerank,
+            expected_hit_lambda=expected_hit_lambda,
+            expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+            recent_pred_sets=recent_pred_sets,
+            anti_repeat_window=anti_repeat_window,
+            anti_repeat_lambda=anti_repeat_lambda,
+        )
+
+    def _record_from_prediction(
+        fold: int,
+        target_row: int,
+        pred_win: List[int],
+        pred_addl: int,
+        actual_win: List[int],
+        actual_addl: int,
+        cluster_last: int,
+        cluster_pred_next: int,
+    ) -> Dict[str, object]:
+        win_hits, addl_hit = summarize_hits(pred_win, pred_addl, actual_win, int(actual_addl))
+        return {
+            "fold": fold,
+            "target_row": target_row,
+            "draw": _row_draw(target_row),
+            "date": _row_date(target_row),
+            "pred_win": " ".join(str(x) for x in pred_win),
+            "actual_win": " ".join(str(x) for x in sorted(actual_win)),
+            "pred_addl": pred_addl,
+            "actual_addl": int(actual_addl),
+            "win_hits": win_hits,
+            "addl_hit": addl_hit,
+            "cluster_last": cluster_last,
+            "cluster_pred_next": cluster_pred_next,
+        }
+
     if focus_last_n > 0:
         # Strict one-step walk-forward on most recent N draws only.
         test_seq = recent_seq_indices(n_samples, focus_last_n, min_train=max(120, config.seq_len * 4))
         payloads: List[Dict[str, object]] = []
-        for pos, seq_i in enumerate(test_seq, start=1):
-            train_idx, val_idx = one_step_train_val_indices(int(seq_i), min_train_core=max(120, config.seq_len * 4))
-            if len(train_idx) == 0 or len(val_idx) == 0:
-                continue
+        if bool(no_retrain) and inference_model is not None and inference_scaler is not None and len(test_seq) > 0:
             n_features = X_seq.shape[-1]
-            n_restart = int(max(1, backtest_restarts))
-            top_k = int(max(1, min(restart_ensemble_topk, n_restart)))
-            restart_pool: List[Tuple[float, Dict[str, np.ndarray]]] = []
-            if bool(train_recency_weighted):
-                val_sw = recency_weights_for_target_rows(df, target_rows[np.asarray(val_idx, dtype=np.int32)])
-            else:
-                val_sw = None
-
-            for restart_i in range(n_restart):
-                restart_seed = int(ACTIVE_SEED + 97 * restart_i + 13 * pos)
-                set_global_seed(restart_seed)
+            X_test = inference_scaler.transform(X_seq[test_seq].reshape(-1, n_features)).reshape(
+                len(test_seq), X_seq.shape[1], n_features
+            ).astype(np.float32)
+            preds = predict_outputs_dict(inference_model, X_test)
+            for pos, seq_i in enumerate(test_seq, start=1):
+                target_row = int(target_rows[seq_i])
+                pred_pack = {k: v[pos - 1 : pos] for k, v in preds.items()}
+                payloads.append(_build_payload(pos, target_row, pred_pack))
+        else:
+            for pos, seq_i in enumerate(test_seq, start=1):
+                train_idx, val_idx = one_step_train_val_indices(int(seq_i), min_train_core=max(120, config.seq_len * 4))
+                if len(train_idx) == 0 or len(val_idx) == 0:
+                    continue
+                n_features = X_seq.shape[-1]
+                n_restart = int(max(1, backtest_restarts))
+                top_k = int(max(1, min(restart_ensemble_topk, n_restart)))
+                restart_pool: List[Tuple[float, Dict[str, np.ndarray]]] = []
                 if bool(train_recency_weighted):
-                    train_sw = sharpen_recency_weights(
-                        recency_weights_for_target_rows(df, target_rows[np.asarray(train_idx, dtype=np.int32)]),
-                        power=1.35,
-                        floor=0.32,
-                    )
+                    val_sw = recency_weights_for_target_rows(df, target_rows[np.asarray(val_idx, dtype=np.int32)])
                 else:
-                    train_sw = None
-                model, _, _, scaler_x = run_single_fit(
-                    config=config,
-                    X_seq=X_seq,
-                    y_raw=y_raw,
-                    train_idx=train_idx,
-                    val_idx=val_idx,
-                    epochs=backtest_epochs,
-                    batch_size=batch_size,
-                    steps_per_execution=steps_per_execution,
-                    cache_dataset=cache_dataset,
-                    train_sample_weights=train_sw,
-                    val_sample_weights=val_sw,
-                    verbose=0,
-                )
-                X_test = scaler_x.transform(X_seq[[seq_i]].reshape(-1, n_features)).reshape(
-                    1, X_seq.shape[1], n_features
-                ).astype(np.float32)
-                pred_one = predict_outputs_dict(model, X_test)
-                val_metrics = evaluate_hit_score(
-                    model=model,
-                    scaler_x=scaler_x,
-                    X_seq=X_seq,
-                    eval_idx=np.asarray(val_idx, dtype=np.int32),
-                    target_rows=target_rows,
-                    df=df,
-                    win_cluster_prior_matrix=win_cluster_prior_matrix,
-                    graph_prior_matrix=graph_prior_matrix,
-                    addl_cluster_prior_matrix=addl_cluster_prior_matrix,
-                    repel_prior_matrix=repel_prior_matrix,
-                    weights=blend_weights,
-                    sample_weights=val_sw,
-                    dynamic_blend=dynamic_blend,
-                )
-                restart_score = float(
-                    3.2 * val_metrics["avg_win_hits"]
-                    + 2.8 * val_metrics["p_hit_ge3"]
-                    + 7.2 * val_metrics["p_hit_ge4"]
-                    + 0.3 * val_metrics["p_hit_ge2"]
-                )
-                restart_pool.append((restart_score, pred_one))
+                    val_sw = None
 
-            restart_pool.sort(key=lambda x: x[0], reverse=True)
-            chosen = restart_pool[:top_k]
-            pred_pack = {
-                k: np.mean(np.stack([p[k] for _, p in chosen], axis=0), axis=0)
-                for k in chosen[0][1].keys()
-            }
-            target_row = int(target_rows[seq_i])
+                for restart_i in range(n_restart):
+                    restart_seed = int(ACTIVE_SEED + 97 * restart_i + 13 * pos)
+                    set_global_seed(restart_seed)
+                    if bool(train_recency_weighted):
+                        train_sw = sharpen_recency_weights(
+                            recency_weights_for_target_rows(df, target_rows[np.asarray(train_idx, dtype=np.int32)]),
+                            power=1.35,
+                            floor=0.32,
+                        )
+                    else:
+                        train_sw = None
+                    model, _, _, scaler_x = run_single_fit(
+                        config=config,
+                        X_seq=X_seq,
+                        y_raw=y_raw,
+                        train_idx=train_idx,
+                        val_idx=val_idx,
+                        epochs=backtest_epochs,
+                        batch_size=batch_size,
+                        steps_per_execution=steps_per_execution,
+                        cache_dataset=cache_dataset,
+                        train_sample_weights=train_sw,
+                        val_sample_weights=val_sw,
+                        verbose=0,
+                    )
+                    X_test = scaler_x.transform(X_seq[[seq_i]].reshape(-1, n_features)).reshape(
+                        1, X_seq.shape[1], n_features
+                    ).astype(np.float32)
+                    pred_one = predict_outputs_dict(model, X_test)
+                    val_metrics = evaluate_hit_score(
+                        model=model,
+                        scaler_x=scaler_x,
+                        X_seq=X_seq,
+                        eval_idx=np.asarray(val_idx, dtype=np.int32),
+                        target_rows=target_rows,
+                        df=df,
+                        win_cluster_prior_matrix=win_cluster_prior_matrix,
+                        graph_prior_matrix=graph_prior_matrix,
+                        embed_prior_matrix=embed_prior_matrix,
+                        addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+                        repel_prior_matrix=repel_prior_matrix,
+                        weights=blend_weights,
+                        sample_weights=val_sw,
+                        dynamic_blend=dynamic_blend,
+                        reward_reranker=reward_reranker,
+                        candidate_max_pool=candidate_max_pool,
+                        candidate_gumbel_samples=candidate_gumbel_samples,
+                        candidate_diversity_lambda=candidate_diversity_lambda,
+                        expected_hit_rerank=expected_hit_rerank,
+                        expected_hit_lambda=expected_hit_lambda,
+                        expected_hit_synergy_lambda=expected_hit_synergy_lambda,
+                        anti_repeat_window=anti_repeat_window,
+                        anti_repeat_lambda=anti_repeat_lambda,
+                    )
+                    restart_score = float(
+                        3.2 * val_metrics["avg_win_hits"]
+                        + 2.8 * val_metrics["p_hit_ge3"]
+                        + 7.2 * val_metrics["p_hit_ge4"]
+                        + 0.3 * val_metrics["p_hit_ge2"]
+                    )
+                    restart_pool.append((restart_score, pred_one))
 
-            hist_labels = cluster_labels[:target_row]
-            _, last_cluster, next_cluster = transition_from_labels(hist_labels, best_k) if len(hist_labels) > 1 else (
-                np.ones((best_k, best_k)) / best_k,
-                int(cluster_labels[max(0, target_row - 1)]),
-                int(cluster_labels[max(0, target_row - 1)]),
-            )
-            actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
-            actual_addl = int(df.loc[target_row, "Addl No."])
-            payloads.append(
-                {
-                    "fold": pos,
-                    "target_row": target_row,
-                    "draw": int(df.loc[target_row, "Draw"]) if not pd.isna(df.loc[target_row, "Draw"]) else "",
-                    "date": df.loc[target_row, "Date"].strftime("%Y-%m-%d") if not pd.isna(df.loc[target_row, "Date"]) else "",
-                    "cluster_last": last_cluster,
-                    "cluster_pred_next": next_cluster,
-                    "pred_pack": pred_pack,
-                    "win_cluster_prior": win_cluster_prior_matrix[target_row],
-                    "graph_prior": graph_prior_matrix[target_row],
-                    "repel_prior": repel_prior_matrix[target_row],
-                    "actual_win": actual_win,
-                    "actual_addl": actual_addl,
+                if not restart_pool:
+                    continue
+                restart_pool.sort(key=lambda x: x[0], reverse=True)
+                chosen = restart_pool[:top_k]
+                pred_pack = {
+                    k: np.mean(np.stack([p[k] for _, p in chosen], axis=0), axis=0)
+                    for k in chosen[0][1].keys()
                 }
-            )
+                target_row = int(target_rows[seq_i])
+                payloads.append(_build_payload(pos, target_row, pred_pack))
 
         if payloads:
             best_weights = dict(blend_weights)
@@ -2750,19 +3398,25 @@ def run_backtest(
             payload_date = np.asarray([item["date"] for item in payloads], dtype=object)
             payload_order = np.arange(len(payloads), dtype=np.float64)
             payload_recency_w = recency_weights_from_draw_date(payload_draw, payload_date, payload_order)
+            payload_recency_w = emphasize_latest_weights(
+                payload_recency_w,
+                latest_n=latest_priority_n,
+                boost=latest_priority_boost,
+                power=1.9,
+            )
             local_random = int(max(64, local_random_candidates if local_random_candidates > 0 else (560 if focus_last_n > 0 else 260)))
             for cand in generate_backtest_blend_candidates(blend_weights, num_random=local_random):
                 hits: List[int] = []
                 addl_hits: List[int] = []
+                recent_pred_sets: List[Tuple[int, ...]] = []
                 for item in payloads:
-                    pred_win, pred_addl = combine_prediction(
-                        pred=item["pred_pack"],
-                        win_cluster_prior=item["win_cluster_prior"],
-                        graph_prior=item["graph_prior"],
-                        repel_prior=item["repel_prior"],
+                    pred_win, pred_addl = _predict_for_target_row(
+                        pred_pack=item["pred_pack"],
+                        target_row=int(item["target_row"]),
                         weights=cand,
-                        dynamic_blend=dynamic_blend,
+                        recent_pred_sets=recent_pred_sets,
                     )
+                    recent_pred_sets.append(tuple(sorted(int(x) for x in pred_win)))
                     h, a = summarize_hits(pred_win, pred_addl, item["actual_win"], int(item["actual_addl"]))
                     hits.append(h)
                     addl_hits.append(a)
@@ -2770,6 +3424,11 @@ def run_backtest(
                 hits_arr = np.asarray(hits, dtype=np.float32)
                 addl_arr = np.asarray(addl_hits, dtype=np.float32)
                 m = hit_metrics_from_arrays(hits_arr, addl_arr, sample_weights=payload_recency_w)
+                tail_n = int(min(max(0, latest_priority_n), len(hits_arr)))
+                if tail_n > 0:
+                    tail_m = hit_metrics_from_arrays(hits_arr[-tail_n:], addl_arr[-tail_n:])
+                else:
+                    tail_m = empty_hit_metrics()
                 if bool(optimize_avg):
                     score = (
                         210.0 * float(m["avg_win_hits"])
@@ -2778,6 +3437,15 @@ def run_backtest(
                         + 52.0 * float(m["p_hit_ge4"])
                         + 6.0 * float(m["addl_acc"])
                     )
+                    # Strongly favor the latest N draws (especially latest 5 by default).
+                    tail_score = (
+                        300.0 * float(tail_m["avg_win_hits"])
+                        + 140.0 * float(tail_m["p_hit_ge2"])
+                        + 120.0 * float(tail_m["p_hit_ge3"])
+                        + 84.0 * float(tail_m["p_hit_ge4"])
+                    )
+                    score += float(latest_priority_lambda) * tail_score
+                    score += float(latest_priority_addl_lambda) * (120.0 * float(tail_m["addl_acc"]))
                 else:
                     score = blend_objective(
                         {
@@ -2793,31 +3461,26 @@ def run_backtest(
                     best_score = score
                     best_weights = dict(cand)
 
+            recent_pred_sets: List[Tuple[int, ...]] = []
             for item in payloads:
-                pred_win, pred_addl = combine_prediction(
-                    pred=item["pred_pack"],
-                    win_cluster_prior=item["win_cluster_prior"],
-                    graph_prior=item["graph_prior"],
-                    repel_prior=item["repel_prior"],
+                pred_win, pred_addl = _predict_for_target_row(
+                    pred_pack=item["pred_pack"],
+                    target_row=int(item["target_row"]),
                     weights=best_weights,
-                    dynamic_blend=dynamic_blend,
+                    recent_pred_sets=recent_pred_sets,
                 )
-                win_hits, addl_hit = summarize_hits(pred_win, pred_addl, item["actual_win"], int(item["actual_addl"]))
+                recent_pred_sets.append(tuple(sorted(int(x) for x in pred_win)))
                 records.append(
-                    {
-                        "fold": item["fold"],
-                        "target_row": item["target_row"],
-                        "draw": item["draw"],
-                        "date": item["date"],
-                        "pred_win": " ".join(str(x) for x in pred_win),
-                        "actual_win": " ".join(str(x) for x in sorted(item["actual_win"])),
-                        "pred_addl": pred_addl,
-                        "actual_addl": int(item["actual_addl"]),
-                        "win_hits": win_hits,
-                        "addl_hit": addl_hit,
-                        "cluster_last": item["cluster_last"],
-                        "cluster_pred_next": item["cluster_pred_next"],
-                    }
+                    _record_from_prediction(
+                        fold=int(item["fold"]),
+                        target_row=int(item["target_row"]),
+                        pred_win=pred_win,
+                        pred_addl=pred_addl,
+                        actual_win=item["actual_win"],
+                        actual_addl=int(item["actual_addl"]),
+                        cluster_last=int(item["cluster_last"]),
+                        cluster_pred_next=int(item["cluster_pred_next"]),
+                    )
                 )
     else:
         fold_count = max(1, int(backtest_folds))
@@ -2859,44 +3522,31 @@ def run_backtest(
             X_test = scaler_x.transform(X_seq[test_idx].reshape(-1, n_features)).reshape(len(test_idx), X_seq.shape[1], n_features).astype(np.float32)
             preds = predict_outputs_dict(model, X_test)
 
+            recent_pred_sets: List[Tuple[int, ...]] = []
             for local_i, seq_i in enumerate(test_idx):
                 pred_pack = {k: v[local_i : local_i + 1] for k, v in preds.items()}
                 target_row = int(target_rows[seq_i])
-
-                hist_labels = cluster_labels[:target_row]
-                _, last_cluster, next_cluster = transition_from_labels(hist_labels, best_k) if len(hist_labels) > 1 else (
-                    np.ones((best_k, best_k)) / best_k,
-                    int(cluster_labels[max(0, target_row - 1)]),
-                    int(cluster_labels[max(0, target_row - 1)]),
-                )
-                pred_win, pred_addl = combine_prediction(
-                    pred=pred_pack,
-                    win_cluster_prior=win_cluster_prior_matrix[target_row],
-                    graph_prior=graph_prior_matrix[target_row],
-                    repel_prior=repel_prior_matrix[target_row],
+                last_cluster, next_cluster = _cluster_state(target_row)
+                pred_win, pred_addl = _predict_for_target_row(
+                    pred_pack=pred_pack,
+                    target_row=target_row,
                     weights=blend_weights,
-                    dynamic_blend=dynamic_blend,
+                    recent_pred_sets=recent_pred_sets,
                 )
-
-                actual_win = df.loc[target_row, WIN_COLS].astype(int).tolist()
-                actual_addl = int(df.loc[target_row, "Addl No."])
-                win_hits, addl_hit = summarize_hits(pred_win, pred_addl, actual_win, actual_addl)
+                recent_pred_sets.append(tuple(sorted(int(x) for x in pred_win)))
+                actual_win, actual_addl = _actual_values(target_row)
 
                 records.append(
-                    {
-                        "fold": fold + 1,
-                        "target_row": target_row,
-                        "draw": int(df.loc[target_row, "Draw"]) if not pd.isna(df.loc[target_row, "Draw"]) else "",
-                        "date": df.loc[target_row, "Date"].strftime("%Y-%m-%d") if not pd.isna(df.loc[target_row, "Date"]) else "",
-                        "pred_win": " ".join(str(x) for x in pred_win),
-                        "actual_win": " ".join(str(x) for x in sorted(actual_win)),
-                        "pred_addl": pred_addl,
-                        "actual_addl": actual_addl,
-                        "win_hits": win_hits,
-                        "addl_hit": addl_hit,
-                        "cluster_last": last_cluster,
-                        "cluster_pred_next": next_cluster,
-                    }
+                    _record_from_prediction(
+                        fold=fold + 1,
+                        target_row=target_row,
+                        pred_win=pred_win,
+                        pred_addl=pred_addl,
+                        actual_win=actual_win,
+                        actual_addl=actual_addl,
+                        cluster_last=last_cluster,
+                        cluster_pred_next=next_cluster,
+                    )
                 )
 
     if not records:
@@ -2940,6 +3590,12 @@ def run_backtest(
         backtest_df["date"].values.astype(object),
         np.arange(n, dtype=np.float64),
     )
+    recency_w = emphasize_latest_weights(
+        recency_w,
+        latest_n=latest_priority_n,
+        boost=latest_priority_boost,
+        power=1.9,
+    )
     weighted_m = hit_metrics_from_arrays(
         backtest_df["win_hits"].values.astype(np.float32),
         backtest_df["addl_hit"].values.astype(np.float32),
@@ -2982,7 +3638,6 @@ def build_single_html_report(
     backtest_df: pd.DataFrame,
     backtest_summary: Dict[str, float],
     prediction: Dict[str, object],
-    diffusion_summary: Dict[str, object],
     transition_matrix: np.ndarray,
     dashboard: Dict[str, object],
     focus_last_n: int,
@@ -3023,10 +3678,6 @@ def build_single_html_report(
         backtest_show["addl_hit"] = backtest_show["addl_hit"].astype(int)
 
     primary_grid_html = df_raw[["Draw", "Date"] + PRIMARY_COLS].to_html(index=False, classes="table grid", border=0)
-    diffusion_trial_show = diffusion_summary["trial_df"].copy()
-    for c in ["lr", "best_score", "best_hit_rate", "best_mse", "final_train_loss"]:
-        if c in diffusion_trial_show.columns:
-            diffusion_trial_show[c] = diffusion_trial_show[c].map(lambda x: f"{x:.6f}" if isinstance(x, float) else x)
     feature_weight_show = feature_weight_tuning_df.copy()
     if not feature_weight_show.empty:
         for c in feature_weight_show.columns:
@@ -3045,6 +3696,11 @@ def build_single_html_report(
         for c in metrics_df.columns:
             if pd.api.types.is_numeric_dtype(metrics_df[c]):
                 metrics_df[c] = metrics_df[c].map(lambda x: f"{x:.6f}" if isinstance(x, (float, np.floating)) else x)
+    blend_pills: List[str] = []
+    for k in WIN_BLEND_KEYS + ["repel"] + ADDL_BLEND_KEYS:
+        if k in calibrated_blend:
+            blend_pills.append(f'<div class="pill"><strong>{k}</strong><br>{float(calibrated_blend[k]):.6f}</div>')
+    blend_pills_html = "".join(blend_pills)
     dashboard_json = json.dumps(dashboard, separators=(",", ":"))
 
     html = f"""<!doctype html>
@@ -3117,37 +3773,6 @@ def build_single_html_report(
       width: 100%;
       height: 360px;
     }}
-    .long-rows {{
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 10px;
-    }}
-    .long-row {{
-      display: flex;
-      gap: 12px;
-      overflow-x: auto;
-      padding-bottom: 8px;
-    }}
-    .long-chart {{
-      flex: 0 0 640px;
-      width: 640px;
-      background: var(--card-2);
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      padding: 8px;
-    }}
-    .long-scroll {{
-      height: 460px;
-      overflow-y: auto;
-      overflow-x: hidden;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #0b1322;
-    }}
-    .plotly-long {{
-      width: 100%;
-      min-height: 620px;
-    }}
     .table {{
       width: 100%;
       border-collapse: collapse;
@@ -3201,18 +3826,14 @@ def build_single_html_report(
   <div class="card">
     <h2>Prediction Output</h2>
     <div class="kpi">
-      <div class="pill"><strong>Predicted Win (Diffusion)</strong><br>{prediction["diffusion_win_numbers"]}</div>
-      <div class="pill"><strong>Predicted Addl (Diffusion)</strong><br>{prediction["diffusion_addl_number"]}</div>
-      <div class="pill"><strong>Predicted Win (Hybrid DL)</strong><br>{prediction["hybrid_win_numbers"]}</div>
-      <div class="pill"><strong>Predicted Addl (Hybrid DL)</strong><br>{prediction["hybrid_addl_number"]}</div>
+      <div class="pill"><strong>Predicted Win</strong><br>{prediction["hybrid_win_numbers"]}</div>
+      <div class="pill"><strong>Predicted Addl</strong><br>{prediction["hybrid_addl_number"]}</div>
       <div class="pill"><strong>Cluster Last -> Next</strong><br>{prediction["cluster_last"]} -> {prediction["cluster_next"]}</div>
       <div class="pill"><strong>Predicted Sum / Mean</strong><br>{prediction["pred_sum"]} / {prediction["pred_mean"]:.2f}</div>
       <div class="pill"><strong>Low / High</strong><br>{prediction["low_count"]} / {prediction["high_count"]}</div>
       <div class="pill"><strong>Odd / Even</strong><br>{prediction["odd_count"]} / {prediction["even_count"]}</div>
     </div>
-    <p class="small">
-      Final set uses diffusion next-day extension; hybrid DL output is shown as reference.
-    </p>
+    <p class="small">Final prediction uses Hybrid DL blend.</p>
   </div>
 
   <div class="card">
@@ -3237,7 +3858,8 @@ def build_single_html_report(
       <div class="pill"><strong>Other</strong><br>{feature_group_weights["other"]:.4f}</div>
       <div class="pill"><strong>Repel</strong><br>{feature_group_weights["repel"]:.4f}</div>
       <div class="pill"><strong>Cluster Prior</strong><br>{feature_group_weights["cluster"]:.4f}</div>
-      <div class="pill"><strong>Line Convergence</strong><br>{feature_group_weights["line"]:.4f}</div>
+      <div class="pill"><strong>Graph Co-Occurrence</strong><br>{feature_group_weights["graph"]:.4f}</div>
+      <div class="pill"><strong>Vector Embedding</strong><br>{feature_group_weights["embed"]:.4f}</div>
     </div>
     {"<h3>Feature Weight Tuning Trials</h3><div class='grid-wrap'>" + html_table(feature_weight_show) + "</div>" if not feature_weight_show.empty else "<p class='small'>Feature weight tuning was disabled for this run.</p>"}
   </div>
@@ -3245,29 +3867,9 @@ def build_single_html_report(
   <div class="card">
     <h2>Adaptive Blend Weights</h2>
     <div class="kpi">
-      <div class="pill"><strong>model_soft</strong><br>{calibrated_blend["model_soft"]:.6f}</div>
-      <div class="pill"><strong>cluster</strong><br>{calibrated_blend["cluster"]:.6f}</div>
-      <div class="pill"><strong>graph</strong><br>{calibrated_blend.get("graph", 0.0):.6f}</div>
-      <div class="pill"><strong>repel</strong><br>{calibrated_blend["repel"]:.6f}</div>
-      <div class="pill"><strong>addl_model</strong><br>{calibrated_blend["addl_model"]:.6f}</div>
+      {blend_pills_html}
     </div>
     {"<h3>Component Performance (weight basis)</h3><div class='grid-wrap'>" + html_table(blend_component_show) + "</div>" if not blend_component_show.empty else "<p class='small'>Adaptive component calibration was not available.</p>"}
-  </div>
-
-  <div class="card">
-    <h2>Pattern Proxy (Diffusion Training Removed)</h2>
-    <div class="kpi">
-      <div class="pill"><strong>Window Rows</strong><br>{diffusion_summary["window"]}</div>
-      <div class="pill"><strong>Best Trial Score</strong><br>{diffusion_summary["trial_score"]:.4f}</div>
-      <div class="pill"><strong>Pattern Hit Rate</strong><br>{diffusion_summary["trial_hit_rate"]:.4%}</div>
-      <div class="pill"><strong>MSE</strong><br>{diffusion_summary["trial_mse"]:.6f}</div>
-      <div class="pill"><strong>Future Samples</strong><br>{diffusion_summary["future_windows_used"]}</div>
-      <div class="pill"><strong>Proxy Params</strong><br>{diffusion_summary["trial_best"]}</div>
-    </div>
-    <h3>Proxy Trial Summary</h3>
-    <div class="grid-wrap">
-      {html_table(diffusion_trial_show)}
-    </div>
   </div>
 
   <div class="card">
@@ -3281,22 +3883,6 @@ def build_single_html_report(
       <div class="chart-panel"><div id="train_curve" class="plotly"></div></div>
       <div class="chart-panel"><div id="backtest_hist" class="plotly"></div></div>
       <div class="chart-panel"><div id="backtest_trend" class="plotly"></div></div>
-      <div class="chart-panel"><div id="diff_next_prior" class="plotly"></div></div>
-      <div class="chart-panel"><div id="diff_tune_curve" class="plotly"></div></div>
-    </div>
-    <h3>Long Grid Charts</h3>
-    <div class="long-rows">
-      <div class="long-row">
-        <div class="long-chart"><div class="long-scroll"><div id="occurrence_heat" class="plotly-long"></div></div></div>
-        <div class="long-chart"><div class="long-scroll"><div id="line_prior_heat" class="plotly-long"></div></div></div>
-        <div class="long-chart"><div class="long-scroll"><div id="line_merge_heat" class="plotly-long"></div></div></div>
-      </div>
-      <div class="long-row">
-        <div class="long-chart"><div class="long-scroll"><div id="diff_actual" class="plotly-long"></div></div></div>
-        <div class="long-chart"><div class="long-scroll"><div id="diff_generated" class="plotly-long"></div></div></div>
-        <div class="long-chart"><div class="long-scroll"><div id="diff_accuracy" class="plotly-long"></div></div></div>
-        <div class="long-chart"><div class="long-scroll"><div id="diff_overlap" class="plotly-long"></div></div></div>
-      </div>
     </div>
   </div>
 
@@ -3363,51 +3949,6 @@ def build_single_html_report(
       margin: {{l: 52, r: 18, t: 42, b: 42}},
     }};
 
-    const buildYTicks = (labels, maxTicks = 14) => {{
-      const n = Array.isArray(labels) ? labels.length : 0;
-      if (n === 0) return {{vals: [], text: []}};
-      const step = Math.max(1, Math.floor(n / Math.max(1, maxTicks)));
-      const vals = [];
-      const text = [];
-      for (let i = 0; i < n; i += step) {{
-        vals.push(i);
-        text.push(String(labels[i]));
-      }}
-      if (vals[vals.length - 1] !== n - 1) {{
-        vals.push(n - 1);
-        text.push(String(labels[n - 1]));
-      }}
-      return {{vals, text}};
-    }};
-
-    const squareHeatLayout = (title, xTitle, yTitle, yLabels, nCols = 49, maxHeight = 1800) => {{
-      const nRows = Array.isArray(yLabels) ? yLabels.length : 1;
-      const ticks = buildYTicks(yLabels, 14);
-      const cell = 8;
-      const height = Math.max(480, Math.min(maxHeight, 96 + cell * nRows));
-      const width = Math.max(616, 140 + cell * nCols + 84);
-      return {{
-        ...baseLayout,
-        title,
-        height,
-        width,
-        xaxis: {{
-          title: xTitle,
-          dtick: 1,
-          scaleanchor: 'y',
-          scaleratio: 1,
-          constrain: 'domain',
-        }},
-        yaxis: {{
-          title: yTitle,
-          tickmode: 'array',
-          tickvals: ticks.vals,
-          ticktext: ticks.text,
-          autorange: 'reversed',
-        }},
-      }};
-    }};
-
     Plotly.newPlot('cluster_scatter', [{{
       x: D.cluster.scatter_x,
       y: D.cluster.scatter_y,
@@ -3441,14 +3982,6 @@ def build_single_html_report(
       colorscale: 'Viridis'
     }}], {{...baseLayout, title:'Cluster Pattern Heatmap (Win Columns Focus)'}}, {{responsive:true}});
 
-    Plotly.newPlot('occurrence_heat', [{{
-      z: D.occupancy.occ_z,
-      x: D.occupancy.num_axis,
-      y: D.occupancy.row_pos,
-      type: 'heatmap',
-      colorscale: 'Greens'
-    }}], squareHeatLayout('Winning Number Occupancy Heatmap', 'Number (1-49)', 'Recent Draw Rows', D.occupancy.row_labels, D.occupancy.num_axis.length, 2100), {{responsive:true}});
-
     Plotly.newPlot('transition_heat', [{{
       z: D.cluster.transition_z,
       x: D.cluster.transition_x,
@@ -3456,22 +3989,6 @@ def build_single_html_report(
       type: 'heatmap',
       colorscale: 'Magma'
     }}], {{...baseLayout, title:'Cluster Transition Probability Matrix'}}, {{responsive:true}});
-
-    Plotly.newPlot('line_prior_heat', [{{
-      z: D.line.prior_z,
-      x: D.line.num_axis,
-      y: D.line.row_pos,
-      type: 'heatmap',
-      colorscale: 'Cividis'
-    }}], squareHeatLayout('Line Endpoint-Convergence Prior', 'Number', 'Recent Draw Rows', D.line.row_labels, D.line.num_axis.length, 2100), {{responsive:true}});
-
-    Plotly.newPlot('line_merge_heat', [{{
-      z: D.line.merge_z,
-      x: D.line.num_axis,
-      y: D.line.row_pos,
-      type: 'heatmap',
-      colorscale: 'YlOrBr'
-    }}], squareHeatLayout('Line Endpoint Merge Density', 'Number', 'Recent Draw Rows', D.line.row_labels, D.line.num_axis.length, 2100), {{responsive:true}});
 
     Plotly.newPlot('tuning_plot', [
       {{
@@ -3533,61 +4050,6 @@ def build_single_html_report(
       }}
     ], {{...baseLayout, title:'Backtest Hit Trend{" (Last " + str(focus_last_n) + ")" if focus_last_n > 0 else ""}', xaxis:{{title:'Sample'}}, yaxis:{{title:'Hit Count'}}}}, {{responsive:true}});
 
-    Plotly.newPlot('diff_actual', [{{
-      z: D.diffusion.actual_z,
-      x: D.diffusion.num_axis,
-      y: D.diffusion.row_pos,
-      type: 'heatmap',
-      colorscale: 'Turbo',
-      zmin: 0,
-      zmax: 1
-    }}], squareHeatLayout('Actual Pattern Grid (Recent Window)', 'Number', 'Draw', D.diffusion.row_labels, D.diffusion.num_axis.length, 2400), {{responsive:true}});
-
-    Plotly.newPlot('diff_generated', [{{
-      z: D.diffusion.generated_z,
-      x: D.diffusion.num_axis,
-      y: D.diffusion.row_pos,
-      type: 'heatmap',
-      colorscale: 'Turbo',
-      zmin: 0,
-      zmax: 1
-    }}], squareHeatLayout('Generated Pattern Grid (Diffusion)', 'Number', 'Draw', D.diffusion.row_labels, D.diffusion.num_axis.length, 2400), {{responsive:true}});
-
-    Plotly.newPlot('diff_accuracy', [{{
-      z: D.diffusion.accuracy_z,
-      x: D.diffusion.num_axis,
-      y: D.diffusion.row_pos,
-      type: 'heatmap',
-      colorscale: 'Viridis',
-      zmin: 0,
-      zmax: 1
-    }}], squareHeatLayout('Accuracy Map (1 - abs(generated-actual))', 'Number', 'Draw', D.diffusion.row_labels, D.diffusion.num_axis.length, 2400), {{responsive:true}});
-
-    Plotly.newPlot('diff_overlap', [{{
-      z: D.diffusion.overlap_z,
-      x: D.diffusion.num_axis,
-      y: D.diffusion.row_pos,
-      type: 'heatmap',
-      colorscale: 'Greens',
-      zmin: 0,
-      zmax: 1
-    }}], squareHeatLayout('Binary Overlap Map (Top-7 vs Actual)', 'Number', 'Draw', D.diffusion.row_labels, D.diffusion.num_axis.length, 2400), {{responsive:true}});
-
-    Plotly.newPlot('diff_next_prior', [{{
-      x: D.diffusion.num_axis,
-      y: D.diffusion.next_prior,
-      type: 'bar',
-      marker: {{color:'#34d399'}}
-    }}], {{...baseLayout, title:'Diffusion Next-Day Number Prior', xaxis:{{title:'Number'}}, yaxis:{{title:'Prior Score'}}}}, {{responsive:true}});
-
-    Plotly.newPlot('diff_tune_curve', [{{
-      x: D.diffusion.loss_epoch,
-      y: D.diffusion.loss_curve,
-      mode:'lines+markers',
-      type:'scatter',
-      marker: {{size:4, color:'#60a5fa'}},
-      line: {{width:2, color:'#60a5fa'}}
-    }}], {{...baseLayout, title:'Best Diffusion Trial Loss Curve', xaxis:{{title:'Epoch'}}, yaxis:{{title:'Train Loss'}}}}, {{responsive:true}});
   </script>
 </body>
 </html>"""
@@ -3599,12 +4061,54 @@ def build_single_html_report(
 def main() -> None:
     args = parse_args()
     set_global_seed(int(args.seed))
+    stage_times: Dict[str, float] = {}
+    t_stage = time.perf_counter()
+
+    def _mark_stage(name: str) -> None:
+        nonlocal t_stage
+        now = time.perf_counter()
+        stage_times[name] = float(now - t_stage)
+        t_stage = now
+
+    def _profile_or_clip(
+        value: float,
+        *,
+        default: float,
+        profile: float,
+        lo: float | None = None,
+        hi: float | None = None,
+    ) -> float:
+        v = float(value)
+        if abs(v - float(default)) < 1e-9:
+            return float(profile)
+        if lo is not None and hi is not None:
+            return float(np.clip(v, lo, hi))
+        if lo is not None:
+            return float(max(v, lo))
+        if hi is not None:
+            return float(min(v, hi))
+        return v
+
+    def _profile_or_floor_int(value: int, *, default_max: int, profile: int, floor: int) -> int:
+        v = int(value)
+        if v <= int(default_max):
+            return int(profile)
+        return int(max(v, floor))
+
+    def _enforce_latest_priority_min(min_boost: float, min_lambda: float, min_addl_lambda: float) -> None:
+        args.latest_priority_n = max(int(args.latest_priority_n), 5)
+        args.latest_priority_boost = max(float(args.latest_priority_boost), float(min_boost))
+        args.latest_priority_lambda = max(float(args.latest_priority_lambda), float(min_lambda))
+        args.latest_priority_addl_lambda = max(float(args.latest_priority_addl_lambda), float(min_addl_lambda))
+
     if bool(args.hit_score_focused):
         prev_focus = int(args.focus_last_n)
-        args.focus_last_n = 10 if int(args.focus_last_n) <= 0 else max(int(args.focus_last_n), 10)
+        args.focus_last_n = 24 if int(args.focus_last_n) <= 0 else max(int(args.focus_last_n), 24)
         if bool(args.sweep_mode):
             args.tune_trials = max(int(args.tune_trials), 8)
             args.tune_epochs = max(int(args.tune_epochs), 8)
+            args.tune_mf_stage1_epochs = max(3, min(int(args.tune_mf_stage1_epochs), int(args.tune_epochs)))
+            args.tune_mf_keep_ratio = float(np.clip(args.tune_mf_keep_ratio, 0.20, 0.70))
             args.multi_restarts = max(int(args.multi_restarts), 2)
             args.final_epochs = max(int(args.final_epochs), 42)
             args.backtest_folds = max(int(args.backtest_folds), 10)
@@ -3621,11 +4125,12 @@ def main() -> None:
             args.restart_ensemble_topk = max(1, min(int(args.restart_ensemble_topk), int(args.backtest_restarts)))
             args.steps_per_execution = max(int(args.steps_per_execution), 24)
             args.dataset_cache = bool(args.dataset_cache) or bool(args.gpu_preallocate)
-            args.diffusion_future_samples = max(48, int(args.diffusion_future_samples))
-            args.diffusion_window = max(48, int(args.diffusion_window))
+            _enforce_latest_priority_min(2.8, 1.6, 1.2)
         else:
             args.tune_trials = max(int(args.tune_trials), 14)
             args.tune_epochs = max(int(args.tune_epochs), 10)
+            args.tune_mf_stage1_epochs = max(4, min(int(args.tune_mf_stage1_epochs), int(args.tune_epochs)))
+            args.tune_mf_keep_ratio = float(np.clip(args.tune_mf_keep_ratio, 0.25, 0.70))
             args.multi_restarts = max(int(args.multi_restarts), 5)
             args.final_epochs = max(int(args.final_epochs), 64)
             args.backtest_folds = max(int(args.backtest_folds), 10)
@@ -3644,8 +4149,7 @@ def main() -> None:
             args.dataset_cache = bool(args.dataset_cache) or bool(args.gpu_preallocate)
             if str(args.perf_mode).lower() == "auto":
                 args.perf_mode = "high"
-            args.diffusion_future_samples = max(int(args.diffusion_future_samples), 240)
-            args.diffusion_window = max(int(args.diffusion_window), 180)
+            _enforce_latest_priority_min(3.4, 2.2, 1.6)
         print(
             "[HIT-FOCUS] enabled: "
             f"focus_last_n {prev_focus}->{args.focus_last_n}, "
@@ -3659,8 +4163,62 @@ def main() -> None:
             f"bt_topk={args.restart_ensemble_topk}, bt_opt_avg={'Y' if args.backtest_optimize_avg else 'N'}, "
             f"train_recent_w={'Y' if args.train_recency_weighted else 'N'}, "
             f"steps_per_exec={args.steps_per_execution}, cache={'Y' if args.dataset_cache else 'N'}, perf={args.perf_mode}, "
-            f"diff_window={args.diffusion_window}, diff_future_samples={args.diffusion_future_samples}, "
-            f"dyn_blend={'Y' if args.uncertainty_dynamic_blend else 'N'}"
+            f"dyn_blend={'Y' if args.uncertainty_dynamic_blend else 'N'}, "
+            f"cand_pool={args.candidate_max_pool}, gumbel={args.candidate_gumbel_samples}, "
+            f"reward={'Y' if args.reward_rerank else 'N'}, "
+            f"anti_repeat_w={args.anti_repeat_window}, anti_repeat_l={float(args.anti_repeat_lambda):.2f}, "
+            f"latestN={args.latest_priority_n}, latestBoost={float(args.latest_priority_boost):.2f}, "
+            f"latestL={float(args.latest_priority_lambda):.2f}, latestAddlL={float(args.latest_priority_addl_lambda):.2f}"
+        )
+    if bool(args.avg_hit_focused):
+        prev_backtest_opt = bool(args.backtest_optimize_avg)
+        args.backtest_optimize_avg = True
+        # Anchor avg-focus defaults to best observed profile:
+        # run_01_L01_base_lowanti (avg_win_hits=1.5000).
+        args.w_graph = _profile_or_clip(args.w_graph, default=1.6, profile=1.90, lo=1.60)
+        args.w_cluster = _profile_or_clip(args.w_cluster, default=1.35, profile=1.00, lo=0.70, hi=1.35)
+        args.reward_a = _profile_or_clip(args.reward_a, default=1.0, profile=2.00, lo=1.70, hi=2.40)
+        args.reward_b = _profile_or_clip(args.reward_b, default=2.4, profile=2.30, lo=1.80, hi=2.80)
+        args.reward_c = _profile_or_clip(args.reward_c, default=6.8, profile=4.60, lo=3.60, hi=5.80)
+        args.reward_scale = _profile_or_clip(args.reward_scale, default=0.55, profile=0.55, lo=0.45, hi=0.70)
+        args.anti_repeat_window = _profile_or_floor_int(args.anti_repeat_window, default_max=10, profile=12, floor=10)
+        args.anti_repeat_lambda = _profile_or_clip(args.anti_repeat_lambda, default=1.25, profile=0.55, lo=0.45, hi=1.10)
+        args.candidate_diversity_lambda = _profile_or_clip(
+            args.candidate_diversity_lambda, default=0.11, profile=0.08, lo=0.05, hi=0.16
+        )
+        args.candidate_max_pool = _profile_or_floor_int(args.candidate_max_pool, default_max=48, profile=72, floor=48)
+        args.candidate_gumbel_samples = _profile_or_floor_int(args.candidate_gumbel_samples, default_max=28, profile=52, floor=28)
+        args.expected_hit_rerank = True
+        args.expected_hit_lambda = _profile_or_clip(args.expected_hit_lambda, default=2.20, profile=2.80, lo=2.20, hi=3.40)
+        args.expected_hit_synergy_lambda = _profile_or_clip(
+            args.expected_hit_synergy_lambda, default=0.48, profile=0.72, lo=0.40, hi=1.00
+        )
+        args.latest_priority_n = _profile_or_floor_int(args.latest_priority_n, default_max=5, profile=5, floor=3)
+        args.latest_priority_boost = _profile_or_clip(
+            args.latest_priority_boost, default=3.4, profile=4.2, lo=2.6, hi=7.0
+        )
+        args.latest_priority_lambda = _profile_or_clip(
+            args.latest_priority_lambda, default=2.2, profile=2.9, lo=1.4, hi=5.0
+        )
+        args.latest_priority_addl_lambda = _profile_or_clip(
+            args.latest_priority_addl_lambda, default=1.6, profile=2.3, lo=0.9, hi=4.0
+        )
+        print(
+            "[AVG-FOCUS] enabled: "
+            f"bt_opt_avg {prev_backtest_opt}->{args.backtest_optimize_avg}, "
+            f"w_graph={args.w_graph:.2f}, w_cluster={args.w_cluster:.2f}, "
+            f"reward(a,b,c)=({args.reward_a:.2f},{args.reward_b:.2f},{args.reward_c:.2f}), "
+            f"reward_scale={args.reward_scale:.2f}, anti_repeat_l={args.anti_repeat_lambda:.2f}, "
+            f"diversity_l={args.candidate_diversity_lambda:.2f}, "
+            f"expected_hit=Y lambda={args.expected_hit_lambda:.2f}, synergy={args.expected_hit_synergy_lambda:.2f}, "
+            f"latestN={args.latest_priority_n}, latestBoost={args.latest_priority_boost:.2f}, "
+            f"latestL={args.latest_priority_lambda:.2f}, latestAddlL={args.latest_priority_addl_lambda:.2f}"
+        )
+    objective_hit_focused = bool(args.hit_score_focused and (not args.avg_hit_focused))
+    if bool(args.avg_hit_focused) and bool(args.hit_score_focused):
+        print(
+            "[AVG-FOCUS] objective override: using avg-oriented tuning/restart/blend scoring "
+            "(tail-hit objective disabled for model selection)"
         )
     csv_path = Path(args.csv)
     if not csv_path.exists():
@@ -3689,21 +4247,6 @@ def main() -> None:
     df_raw = pd.read_csv(csv_path)
     df, primary_cols, other_cols = prepare_dataframe(df_raw)
     print(f"Loaded rows={len(df)}")
-
-    diffusion_window = int(max(24, min(args.diffusion_window, len(df))))
-    print(
-        f"Using diffusion proxy (training removed): window={diffusion_window}, "
-        f"future_samples={max(24, int(args.diffusion_future_samples))}"
-    )
-    diffusion_summary = build_diffusion_proxy_suite(
-        df=df,
-        window=diffusion_window,
-        future_samples=max(24, int(args.diffusion_future_samples)),
-    )
-    print(
-        f"Diffusion proxy score={diffusion_summary['trial_score']:.4f}, "
-        f"hit_rate={diffusion_summary['trial_hit_rate']:.4f}, mse={diffusion_summary['trial_mse']:.5f}"
-    )
 
     feature_group_weights = feature_group_weights_from_args(args)
     feature_weight_tuning_df = pd.DataFrame()
@@ -3741,9 +4284,9 @@ def main() -> None:
     silhouette = float(pipe["silhouette"])
     embedding = pipe["embedding"]
     cluster_profile_means = pipe["cluster_profile_means"]
-    line_prior_matrix = pipe["line_prior_matrix"]
-    line_merge_matrix = pipe["line_merge_matrix"]
     graph_prior_matrix = pipe["graph_prior_matrix"]
+    embed_prior_matrix = pipe["embed_prior_matrix"]
+    addl_embed_prior_matrix = pipe["addl_embed_prior_matrix"]
     repel_prior_matrix = pipe["repel_prior_matrix"]
     win_cluster_prior_matrix = pipe["win_cluster_prior_matrix"]
     addl_cluster_prior_matrix = pipe["addl_cluster_prior_matrix"]
@@ -3755,6 +4298,7 @@ def main() -> None:
     for seq_len in candidate_seq_lens:
         seq_cache[seq_len] = build_sequences(X_weighted, df, seq_len, other_cols)
         print(f"Prepared sequences for seq_len={seq_len}: {seq_cache[seq_len][0].shape}")
+    _mark_stage("features_and_sequences")
 
     # Hyperparameter tuning via walk-forward validation.
     trial_configs = generate_trial_configs(args.tune_trials)
@@ -3763,12 +4307,13 @@ def main() -> None:
         f"Running tuning: trials={len(trial_configs)}, folds={args.tune_folds}, "
         f"epochs={args.tune_epochs}, recent_focus={recent_mode}, last_n={args.focus_last_n}"
     )
-    tuning_df = run_tuning(
+    tuning_df = run_tuning_multifidelity(
         trial_configs=trial_configs,
         seq_cache=seq_cache,
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
         graph_prior_matrix=graph_prior_matrix,
+        embed_prior_matrix=embed_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         blend_weights=BLEND_WEIGHTS,
@@ -3776,11 +4321,22 @@ def main() -> None:
         tune_epochs=args.tune_epochs,
         focus_last_n=args.focus_last_n,
         batch_size=int(hw["batch_size"]),
-        hit_score_focused=bool(args.hit_score_focused),
+        hit_score_focused=objective_hit_focused,
         steps_per_execution=int(args.steps_per_execution),
         cache_dataset=bool(args.dataset_cache),
         train_recency_weighted=bool(args.train_recency_weighted),
         dynamic_blend=bool(args.uncertainty_dynamic_blend),
+        enable_multifidelity=bool(args.tune_multifidelity),
+        stage1_epochs=int(args.tune_mf_stage1_epochs),
+        keep_ratio=float(args.tune_mf_keep_ratio),
+        candidate_max_pool=int(args.candidate_max_pool),
+        candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+        candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+        expected_hit_rerank=bool(args.expected_hit_rerank),
+        expected_hit_lambda=float(args.expected_hit_lambda),
+        expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+        anti_repeat_window=int(args.anti_repeat_window),
+        anti_repeat_lambda=float(args.anti_repeat_lambda),
     )
     best_row = tuning_df.iloc[0]
     best_config = ModelConfig(
@@ -3792,6 +4348,7 @@ def main() -> None:
         lr=float(best_row["lr"]),
     )
     print(f"Best config selected: {asdict(best_config)}")
+    _mark_stage("tuning")
 
     # Final training using chronological train/val/test split.
     X_seq, y_raw, target_rows = seq_cache[best_config.seq_len]
@@ -3801,6 +4358,12 @@ def main() -> None:
         if len(restart_eval_idx) == 0:
             restart_eval_idx = val_idx
         restart_eval_weights = recency_weights_for_target_rows(df, target_rows[np.asarray(restart_eval_idx, dtype=np.int32)])
+        restart_eval_weights = emphasize_latest_weights(
+            restart_eval_weights,
+            latest_n=int(args.latest_priority_n),
+            boost=float(args.latest_priority_boost),
+            power=1.9,
+        )
         if bool(args.train_recency_weighted):
             final_train_sw = sharpen_recency_weights(
                 recency_weights_for_target_rows(df, target_rows[np.asarray(train_idx, dtype=np.int32)]),
@@ -3859,13 +4422,22 @@ def main() -> None:
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
             graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=BLEND_WEIGHTS,
             sample_weights=restart_eval_weights,
             dynamic_blend=bool(args.uncertainty_dynamic_blend),
+            candidate_max_pool=int(args.candidate_max_pool),
+            candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+            candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+            expected_hit_rerank=bool(args.expected_hit_rerank),
+            expected_hit_lambda=float(args.expected_hit_lambda),
+            expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+            anti_repeat_window=int(args.anti_repeat_window),
+            anti_repeat_lambda=float(args.anti_repeat_lambda),
         )
-        restart_score = float(blend_objective(restart_metrics, focused=bool(args.hit_score_focused)))
+        restart_score = float(blend_objective(restart_metrics, focused=objective_hit_focused))
         restart_val_loss = float(np.min(history_i.history.get("val_loss", [math.inf])))
         print(
             f"[RESTART] {restart_i + 1}/{n_restarts} seed={restart_seed} "
@@ -3929,6 +4501,7 @@ def main() -> None:
         cache=bool(args.dataset_cache),
     )
     final_test_metrics = model.evaluate(test_ds, return_dict=True, verbose=0)
+    _mark_stage("final_training_and_test")
 
     # Blend-weight calibration and selection on validation slice.
     selected_blend = dict(BLEND_WEIGHTS)
@@ -3945,6 +4518,12 @@ def main() -> None:
         if len(blend_eval_idx) == 0:
             blend_eval_idx = val_idx
         blend_eval_weights = recency_weights_for_target_rows(df, target_rows[np.asarray(blend_eval_idx, dtype=np.int32)])
+        blend_eval_weights = emphasize_latest_weights(
+            blend_eval_weights,
+            latest_n=int(args.latest_priority_n),
+            boost=float(args.latest_priority_boost),
+            power=1.9,
+        )
     else:
         blend_eval_idx = val_idx
         blend_eval_weights = None
@@ -3965,12 +4544,21 @@ def main() -> None:
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
         graph_prior_matrix=graph_prior_matrix,
+        embed_prior_matrix=embed_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         base_weights=BLEND_WEIGHTS,
         sample_weights=blend_eval_weights,
         cached_preds=blend_eval_preds,
         dynamic_blend=bool(args.uncertainty_dynamic_blend),
+        candidate_max_pool=int(args.candidate_max_pool),
+        candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+        candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+        expected_hit_rerank=bool(args.expected_hit_rerank),
+        expected_hit_lambda=float(args.expected_hit_lambda),
+        expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+        anti_repeat_window=int(args.anti_repeat_window),
+        anti_repeat_lambda=float(args.anti_repeat_lambda),
     )
     print(f"Adaptive calibrated blend seed: {calibrated_blend}")
     if not blend_component_df.empty:
@@ -3982,7 +4570,7 @@ def main() -> None:
     # Keep a few hand-crafted variants as fallback.
     blend_candidates.extend(generate_blend_candidates(calibrated_blend))
     best_blend_score = -1e9
-    blend_focused = bool(args.hit_score_focused)
+    blend_focused = objective_hit_focused
     for cand in blend_candidates:
         val_hit_metrics = evaluate_hit_score(
             model=model,
@@ -3993,12 +4581,21 @@ def main() -> None:
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
             graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=cand,
             sample_weights=blend_eval_weights,
             cached_preds=blend_eval_preds,
             dynamic_blend=bool(args.uncertainty_dynamic_blend),
+            candidate_max_pool=int(args.candidate_max_pool),
+            candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+            candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+            expected_hit_rerank=bool(args.expected_hit_rerank),
+            expected_hit_lambda=float(args.expected_hit_lambda),
+            expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+            anti_repeat_window=int(args.anti_repeat_window),
+            anti_repeat_lambda=float(args.anti_repeat_lambda),
         )
         blend_score = blend_objective(val_hit_metrics, focused=blend_focused)
         if blend_score > best_blend_score:
@@ -4016,12 +4613,21 @@ def main() -> None:
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
             graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=cand,
             sample_weights=blend_eval_weights,
             cached_preds=blend_eval_preds,
             dynamic_blend=bool(args.uncertainty_dynamic_blend),
+            candidate_max_pool=int(args.candidate_max_pool),
+            candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+            candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+            expected_hit_rerank=bool(args.expected_hit_rerank),
+            expected_hit_lambda=float(args.expected_hit_lambda),
+            expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+            anti_repeat_window=int(args.anti_repeat_window),
+            anti_repeat_lambda=float(args.anti_repeat_lambda),
         )
 
     selected_blend, selected_blend_metrics, best_blend_score = coordinate_ascent_blend_search(
@@ -4051,9 +4657,49 @@ def main() -> None:
     print(f"Selected blend metrics on {blend_scope}: {selected_blend_metrics}")
     print(f"Selected blend objective on {blend_scope}: {best_blend_score:.6f}")
 
+    reward_reranker: RewardReranker | None = None
+    if bool(args.reward_rerank):
+        reward_reranker = fit_reward_reranker(
+            model=model,
+            scaler_x=scaler_x,
+            X_seq=X_seq,
+            eval_idx=np.asarray(blend_eval_idx, dtype=np.int32),
+            target_rows=target_rows,
+            df=df,
+            win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
+            repel_prior_matrix=repel_prior_matrix,
+            blend_weights=selected_blend,
+            dynamic_blend=bool(args.uncertainty_dynamic_blend),
+            reward_a=float(args.reward_a),
+            reward_b=float(args.reward_b),
+            reward_c=float(args.reward_c),
+            reward_window=int(args.reward_window),
+            hardneg_boost=float(args.reward_hardneg_boost),
+            ridge=float(args.reward_ridge),
+            reward_scale=float(args.reward_scale),
+            candidate_max_pool=int(args.candidate_max_pool),
+            candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+            candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+        )
+        if reward_reranker is None:
+            print("[REWARD] reranker disabled (insufficient training samples).")
+        else:
+            print(
+                "[REWARD] reranker fitted: "
+                f"window={args.reward_window}, a={args.reward_a:.2f}, b={args.reward_b:.2f}, "
+                f"c={args.reward_c:.2f}, scale={args.reward_scale:.2f}"
+            )
+    _mark_stage("blend_search")
+
     # Walk-forward expanding-window backtest for historical validation.
     if args.focus_last_n > 0:
-        print(f"Running strict walk-forward backtest on last {args.focus_last_n} draws, epochs={args.backtest_epochs}")
+        mode_note = "no-retrain" if bool(args.backtest_no_retrain) else "retrain-per-step"
+        print(
+            f"Running strict walk-forward backtest on last {args.focus_last_n} draws, "
+            f"epochs={args.backtest_epochs}, mode={mode_note}"
+        )
     else:
         print(f"Running walk-forward backtest: folds={args.backtest_folds}, epochs={args.backtest_epochs}")
     backtest_df, backtest_summary = run_backtest(
@@ -4066,12 +4712,17 @@ def main() -> None:
         target_rows=target_rows,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
         graph_prior_matrix=graph_prior_matrix,
+        embed_prior_matrix=embed_prior_matrix,
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         blend_weights=selected_blend,
         backtest_folds=args.backtest_folds,
         backtest_epochs=args.backtest_epochs,
         focus_last_n=args.focus_last_n,
+        latest_priority_n=int(args.latest_priority_n),
+        latest_priority_boost=float(args.latest_priority_boost),
+        latest_priority_lambda=float(args.latest_priority_lambda),
+        latest_priority_addl_lambda=float(args.latest_priority_addl_lambda),
         batch_size=int(hw["batch_size"]),
         local_random_candidates=int(args.backtest_local_random_candidates),
         optimize_avg=bool(args.backtest_optimize_avg),
@@ -4081,7 +4732,20 @@ def main() -> None:
         cache_dataset=bool(args.dataset_cache),
         train_recency_weighted=bool(args.train_recency_weighted),
         dynamic_blend=bool(args.uncertainty_dynamic_blend),
+        reward_reranker=reward_reranker,
+        candidate_max_pool=int(args.candidate_max_pool),
+        candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+        candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+        expected_hit_rerank=bool(args.expected_hit_rerank),
+        expected_hit_lambda=float(args.expected_hit_lambda),
+        expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+        anti_repeat_window=int(args.anti_repeat_window),
+        anti_repeat_lambda=float(args.anti_repeat_lambda),
+        no_retrain=bool(args.backtest_no_retrain),
+        inference_model=model,
+        inference_scaler=scaler_x,
     )
+    _mark_stage("backtest")
 
     # Final prediction for next draw using latest sequence + cluster trend priors.
     transition_matrix = cluster_transition_matrix
@@ -4102,6 +4766,7 @@ def main() -> None:
     dummy_next = df.iloc[[-1]].copy()
     next_df = pd.concat([df, dummy_next], ignore_index=True)
     repel_next_prior = build_repel_system(next_df)["repel_prior"][-1]
+    embed_next_prior = normalize_prob(embed_prior_matrix[-1])
 
     latest_seq = scaler_x.transform(X_seq[-1].reshape(-1, n_features)).reshape(1, X_seq.shape[1], n_features).astype(np.float32)
     pred_latest = predict_outputs_dict(model, latest_seq)
@@ -4109,44 +4774,38 @@ def main() -> None:
         pred=pred_latest,
         win_cluster_prior=win_cluster_next_prior,
         graph_prior=normalize_prob(graph_prior_matrix[-1]),
+        embed_prior=embed_next_prior,
         repel_prior=repel_next_prior,
         weights=selected_blend,
         dynamic_blend=bool(args.uncertainty_dynamic_blend),
+        reward_reranker=reward_reranker,
+        candidate_max_pool=int(args.candidate_max_pool),
+        candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+        candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+        expected_hit_rerank=bool(args.expected_hit_rerank),
+        expected_hit_lambda=float(args.expected_hit_lambda),
+        expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+        anti_repeat_window=int(args.anti_repeat_window),
+        anti_repeat_lambda=float(args.anti_repeat_lambda),
     )
 
-    diff_pred_win = [int(x) for x in diffusion_summary["diffusion_pred_win"]]
-    diff_pred_addl = int(diffusion_summary["diffusion_pred_addl"])
     pred_stats = {
-        "diffusion_win_numbers": diff_pred_win,
-        "diffusion_addl_number": diff_pred_addl,
         "hybrid_win_numbers": pred_win,
         "hybrid_addl_number": pred_addl,
         "cluster_last": int(cluster_last),
         "cluster_next": int(cluster_next),
-        "pred_sum": int(sum(diff_pred_win)),
-        "pred_mean": float(np.mean(diff_pred_win)),
-        "low_count": int(sum(1 for n in diff_pred_win if n <= 24)),
-        "high_count": int(sum(1 for n in diff_pred_win if n > 24)),
-        "odd_count": int(sum(1 for n in diff_pred_win if n % 2 == 1)),
-        "even_count": int(sum(1 for n in diff_pred_win if n % 2 == 0)),
+        "pred_sum": int(sum(pred_win)),
+        "pred_mean": float(np.mean(pred_win)),
+        "low_count": int(sum(1 for n in pred_win if n <= 24)),
+        "high_count": int(sum(1 for n in pred_win if n > 24)),
+        "odd_count": int(sum(1 for n in pred_win if n % 2 == 1)),
+        "even_count": int(sum(1 for n in pred_win if n % 2 == 0)),
     }
 
     # Interactive dashboard payload (Grafana-style Plotly charts).
     history_loss = [float(x) for x in final_history.history.get("loss", [])]
     history_val_loss = [float(x) for x in final_history.history.get("val_loss", [])]
     history_epoch = list(range(1, len(history_loss) + 1))
-
-    recent_window = min(180, len(df))
-    recent_idx = np.arange(len(df) - recent_window, len(df))
-    occ_heat = np.zeros((recent_window, 49), dtype=np.float32)
-    for i, row_i in enumerate(recent_idx):
-        wins = df.loc[row_i, WIN_COLS].astype(int).values
-        addl = int(df.loc[row_i, "Addl No."])
-        occ_heat[i, wins - 1] = 1.0
-        occ_heat[i, addl - 1] = max(occ_heat[i, addl - 1], 0.6)
-
-    row_labels = [str(int(df.loc[i, "Draw"])) if not pd.isna(df.loc[i, "Draw"]) else str(i) for i in recent_idx]
-    row_pos = list(range(recent_window))
 
     if backtest_df.empty:
         backtest_hits = []
@@ -4175,19 +4834,6 @@ def main() -> None:
             "transition_x": [f"to_{i}" for i in range(transition_matrix.shape[1])],
             "transition_y": [f"from_{i}" for i in range(transition_matrix.shape[0])],
         },
-        "occupancy": {
-            "occ_z": occ_heat.astype(float).tolist(),
-            "num_axis": list(range(1, 50)),
-            "row_labels": row_labels,
-            "row_pos": row_pos,
-        },
-        "line": {
-            "prior_z": line_prior_matrix[recent_idx].astype(float).tolist(),
-            "merge_z": line_merge_matrix[recent_idx].astype(float).tolist(),
-            "num_axis": list(range(1, 50)),
-            "row_labels": row_labels,
-            "row_pos": row_pos,
-        },
         "tuning": {
             "trial": tuning_df["trial"].astype(int).tolist(),
             "p_hit_ge2": tuning_df["mean_val_p_hit_ge2"].astype(float).tolist(),
@@ -4205,18 +4851,6 @@ def main() -> None:
             "win_hits": backtest_hits,
             "rolling": backtest_rolling,
         },
-        "diffusion": {
-            "actual_z": diffusion_summary["target_role"].astype(float).tolist(),
-            "generated_z": diffusion_summary["generated_role"].astype(float).tolist(),
-            "accuracy_z": diffusion_summary["accuracy_map"].astype(float).tolist(),
-            "overlap_z": diffusion_summary["overlap_map"].astype(float).tolist(),
-            "row_labels": diffusion_summary["row_labels"],
-            "row_pos": list(range(len(diffusion_summary["row_labels"]))),
-            "num_axis": list(range(1, 50)),
-            "next_prior": diffusion_summary["diffusion_next_row_prior"].astype(float).tolist(),
-            "loss_epoch": list(range(1, len(diffusion_summary["trial_loss_curve"]) + 1)),
-            "loss_curve": [float(x) for x in diffusion_summary["trial_loss_curve"]],
-        },
     }
 
     cluster_info = {"best_k": best_k, "silhouette": silhouette}
@@ -4232,7 +4866,6 @@ def main() -> None:
         backtest_df=backtest_df,
         backtest_summary=backtest_summary,
         prediction=pred_stats,
-        diffusion_summary=diffusion_summary,
         transition_matrix=transition_matrix,
         dashboard=dashboard,
         focus_last_n=args.focus_last_n,
@@ -4241,16 +4874,26 @@ def main() -> None:
         blend_component_df=blend_component_df,
         calibrated_blend=calibrated_blend,
     )
+    _mark_stage("report_write")
 
     print("")
     print("Prediction (latest):")
-    print(f"Diffusion Win: {diff_pred_win}")
-    print(f"Diffusion Addl: {diff_pred_addl}")
-    print(f"Hybrid Win: {pred_win}")
-    print(f"Hybrid Addl: {pred_addl}")
+    print(f"Win: {pred_win}")
+    print(f"Addl: {pred_addl}")
     print("")
     print("Backtest summary:")
     print(backtest_summary)
+    if not backtest_df.empty and "pred_win" in backtest_df.columns:
+        rep = backtest_df["pred_win"].value_counts()
+        rep = rep[rep > 1]
+        if not rep.empty:
+            top_rep = rep.head(8).to_dict()
+            print(f"[BACKTEST] repeated pred_win sets detected: {top_rep}")
+    print("")
+    print("Stage runtime (seconds):")
+    for k, v in stage_times.items():
+        print(f"  {k}: {v:.2f}")
+    print(f"  total: {sum(stage_times.values()):.2f}")
     print("")
     print(f"Single HTML report generated: {html_path}")
     print("=" * 90)
@@ -4258,3 +4901,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
