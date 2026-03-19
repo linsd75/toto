@@ -28,6 +28,8 @@ import pandas as pd
 
 # CUDA async allocator tends to improve GPU memory reuse and throughput on TF 2.x.
 os.environ.setdefault("TF_GPU_ALLOCATOR", "cuda_malloc_async")
+# Avoid repeated joblib CPU-probing subprocess calls on Windows (seen in logs).
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(max(1, (os.cpu_count() or 4) - 1)))
 
 
 def ensure_cuda_dll_paths() -> None:
@@ -159,7 +161,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sweep-mode", action="store_true", help="Use lighter settings for automated multi-run sweeps")
     parser.add_argument("--csv", default="ToTo-17_Mar_2026.csv", help="Input CSV file path")
     parser.add_argument("--clusters", type=int, default=0, help="Force KMeans clusters (0=auto)")
-    parser.add_argument("--tune-trials", type=int, default=14, help="Random trials sampled from config space")
+    parser.add_argument("--tune-trials", type=int, default=10, help="Random trials sampled from config space")
     parser.add_argument("--tune-folds", type=int, default=3, help="Walk-forward folds per tuning trial")
     parser.add_argument("--tune-epochs", type=int, default=10, help="Epoch cap for each tuning fold")
     parser.add_argument(
@@ -168,11 +170,11 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Use two-stage multi-fidelity tuning (short stage + full stage on shortlist)",
     )
-    parser.add_argument("--tune-mf-stage1-epochs", type=int, default=5, help="Epoch cap for stage-1 multi-fidelity tuning")
-    parser.add_argument("--tune-mf-keep-ratio", type=float, default=0.45, help="Top ratio kept from stage-1 into full stage-2 tuning")
+    parser.add_argument("--tune-mf-stage1-epochs", type=int, default=2, help="Epoch cap for stage-1 multi-fidelity tuning")
+    parser.add_argument("--tune-mf-keep-ratio", type=float, default=0.50, help="Top ratio kept from stage-1 into full stage-2 tuning")
     parser.add_argument("--multi-restarts", type=int, default=5, help="Number of final-training restarts (best restart kept by hit objective)")
-    parser.add_argument("--final-epochs", type=int, default=64, help="Final training epoch cap")
-    parser.add_argument("--backtest-folds", type=int, default=10, help="Expanding-window backtest folds")
+    parser.add_argument("--final-epochs", type=int, default=72, help="Final training epoch cap")
+    parser.add_argument("--backtest-folds", type=int, default=24, help="Expanding-window backtest folds")
     parser.add_argument("--backtest-epochs", type=int, default=20, help="Epoch cap per backtest fold")
     parser.add_argument(
         "--focus-last-n",
@@ -186,7 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-repel", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["repel"], help="Feature weight for repel features")
     parser.add_argument("--w-cluster", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["cluster"], help="Feature weight for cluster-prior features")
     parser.add_argument("--w-graph", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["graph"], help="Feature weight for graph co-occurrence features")
-    parser.add_argument("--w-embed", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["embed"], help="Feature weight for embedding-pattern features")
+    parser.add_argument("--w-embed", type=float, default=1.55, help="Feature weight for embedding-pattern features")
     parser.add_argument("--w-line", dest="w_graph", type=float, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument(
         "--perf-mode",
@@ -195,12 +197,18 @@ def parse_args() -> argparse.Namespace:
         help="Hardware/runtime tuning mode (high tries larger batches and faster execution settings)",
     )
     parser.add_argument(
+        "--process-priority",
+        choices=["auto", "normal", "above_normal", "high", "realtime"],
+        default="high",
+        help="Windows process priority class (auto -> high when perf-mode=high)",
+    )
+    parser.add_argument(
         "--gpu-preallocate",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Reserve near-full GPU memory instead of growth mode",
     )
-    parser.add_argument("--gpu-batch-size", type=int, default=320, help="Override model training batch size")
+    parser.add_argument("--gpu-batch-size", type=int, default=640, help="Override model training batch size")
     parser.add_argument("--steps-per-execution", type=int, default=32, help="Keras steps_per_execution (0 = auto)")
     parser.add_argument(
         "--dataset-cache",
@@ -217,13 +225,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hit-score-focused",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Auto-increase search depth and recent-window emphasis for hit-score optimization",
     )
-    parser.add_argument("--blend-random-candidates", type=int, default=3600, help="Random blend candidates evaluated before coordinate-ascent refinement")
-    parser.add_argument("--blend-coordinate-iters", type=int, default=14, help="Coordinate-ascent iterations after random blend search")
+    parser.add_argument("--blend-random-candidates", type=int, default=3200, help="Random blend candidates evaluated before coordinate-ascent refinement")
+    parser.add_argument("--blend-coordinate-iters", type=int, default=16, help="Coordinate-ascent iterations after random blend search")
     parser.add_argument("--blend-coordinate-step", type=float, default=0.42, help="Initial coordinate-ascent relative step size")
-    parser.add_argument("--blend-simplex-iters", type=int, default=160, help="Local Nelder-Mead iterations after coordinate-ascent")
+    parser.add_argument("--blend-simplex-iters", type=int, default=180, help="Local Nelder-Mead iterations after coordinate-ascent")
     parser.add_argument("--blend-simplex-step", type=float, default=0.24, help="Initial simplex step size in transformed blend space")
     parser.add_argument("--blend-tail-iters", type=int, default=8, help="Tail-hit local refinement iterations after Nelder-Mead")
     parser.add_argument("--blend-tail-candidates", type=int, default=360, help="Candidates evaluated per tail-hit refinement iteration")
@@ -245,13 +253,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backtest-parallel-workers",
         type=int,
-        default=0,
+        default=18,
         help="CPU threads for strict backtest blend-candidate scoring (0 = auto)",
     )
     parser.add_argument(
         "--backtest-progress-every",
         type=int,
-        default=40,
+        default=25,
         help="Heartbeat frequency (candidate count) for strict backtest blend search logs",
     )
     parser.add_argument(
@@ -263,19 +271,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--latest-priority-boost",
         type=float,
-        default=3.4,
+        default=3.8,
         help="Multiplicative recency boost applied to the latest-priority window",
     )
     parser.add_argument(
         "--latest-priority-lambda",
         type=float,
-        default=2.2,
+        default=2.4,
         help="Extra objective weight on latest-priority win-hit performance during backtest blend search",
     )
     parser.add_argument(
         "--latest-priority-addl-lambda",
         type=float,
-        default=1.6,
+        default=1.4,
         help="Extra objective weight on latest-priority additional-number hit performance",
     )
     parser.add_argument(
@@ -284,23 +292,23 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Apply entropy/temperature-calibrated dynamic per-draw blend weighting",
     )
-    parser.add_argument("--candidate-max-pool", type=int, default=48, help="Maximum unique win-set candidates scored per prediction")
-    parser.add_argument("--candidate-gumbel-samples", type=int, default=28, help="Stochastic Gumbel-top-k candidate samples per prediction")
-    parser.add_argument("--candidate-diversity-lambda", type=float, default=0.11, help="Penalty strength for low-spread candidate sets")
+    parser.add_argument("--candidate-max-pool", type=int, default=128, help="Maximum unique win-set candidates scored per prediction")
+    parser.add_argument("--candidate-gumbel-samples", type=int, default=96, help="Stochastic Gumbel-top-k candidate samples per prediction")
+    parser.add_argument("--candidate-diversity-lambda", type=float, default=0.10, help="Penalty strength for low-spread candidate sets")
     parser.add_argument(
         "--expected-hit-rerank",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Add expected-hit utility term during candidate ranking (avg-hit oriented)",
     )
-    parser.add_argument("--expected-hit-lambda", type=float, default=2.20, help="Weight for expected-hit utility term")
-    parser.add_argument("--expected-hit-synergy-lambda", type=float, default=0.48, help="Weight for component-consensus utility term")
+    parser.add_argument("--expected-hit-lambda", type=float, default=2.65, help="Weight for expected-hit utility term")
+    parser.add_argument("--expected-hit-synergy-lambda", type=float, default=0.55, help="Weight for component-consensus utility term")
     parser.add_argument("--anti-repeat-window", type=int, default=10, help="Recent prediction window used to penalize repeated win sets")
-    parser.add_argument("--anti-repeat-lambda", type=float, default=1.25, help="Penalty strength against repeated/high-overlap predicted win sets")
+    parser.add_argument("--anti-repeat-lambda", type=float, default=0.90, help="Penalty strength against repeated/high-overlap predicted win sets")
     parser.add_argument(
         "--avg-hit-focused",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Profile that prioritizes avg_win_hits over tail-only metrics",
     )
     parser.add_argument(
@@ -310,9 +318,9 @@ def parse_args() -> argparse.Namespace:
         help="Enable reward-model reranking on candidate win sets",
     )
     parser.add_argument("--reward-window", type=int, default=72, help="Recent tuning rows used to fit reward reranker")
-    parser.add_argument("--reward-a", type=float, default=1.0, help="Reward coefficient for hit count")
-    parser.add_argument("--reward-b", type=float, default=2.4, help="Reward bonus for hits>=3")
-    parser.add_argument("--reward-c", type=float, default=6.8, help="Reward bonus for hits>=4")
+    parser.add_argument("--reward-a", type=float, default=1.9, help="Reward coefficient for hit count")
+    parser.add_argument("--reward-b", type=float, default=2.7, help="Reward bonus for hits>=3")
+    parser.add_argument("--reward-c", type=float, default=4.6, help="Reward bonus for hits>=4")
     parser.add_argument("--reward-hardneg-boost", type=float, default=0.9, help="Extra weight for hard negatives (hits 1-2) in reward fitting")
     parser.add_argument("--reward-ridge", type=float, default=0.18, help="L2 regularization for reward reranker fit")
     parser.add_argument("--reward-scale", type=float, default=0.55, help="Blend scale for reward reranker score at inference time")
@@ -396,6 +404,61 @@ def configure_hardware(
     except Exception:
         hw["mixed_precision"] = False
     return hw
+
+
+def set_windows_process_priority(level: str) -> str:
+    """
+    Best-effort process priority bump for Windows.
+    Returns applied level or reason string.
+    """
+    if os.name != "nt":
+        return "unsupported_os"
+    level_key = str(level).strip().lower()
+    classes = {
+        "normal": 0x20,
+        "above_normal": 0x8000,
+        "high": 0x80,
+        "realtime": 0x100,
+    }
+    pri = classes.get(level_key)
+    if pri is None:
+        return "skipped"
+    try:
+        import ctypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.SetPriorityClass.restype = ctypes.c_int
+        handle = ctypes.c_void_p(k32.GetCurrentProcess())
+        ok = bool(k32.SetPriorityClass(handle, ctypes.c_uint32(pri)))
+        if ok:
+            return level_key
+        err = ctypes.get_last_error()
+        return f"failed_err_{int(err)}"
+    except Exception as exc:
+        return f"error_{type(exc).__name__}"
+
+
+def enable_timestamped_print() -> None:
+    """
+    Prefix all Python print lines with local timestamp for easier log tracing.
+    """
+    import builtins
+
+    if getattr(enable_timestamped_print, "_enabled", False):
+        return
+    original_print = builtins.print
+
+    def ts_print(*args, **kwargs):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if not args:
+            return original_print(f"{stamp} [INFO]", **kwargs)
+        first = str(args[0])
+        return original_print(f"{stamp} [INFO] {first}", *args[1:], **kwargs)
+
+    builtins.print = ts_print
+    setattr(enable_timestamped_print, "_enabled", True)
 
 
 def parse_ratio_column(series: pd.Series, default_left: int = 3, default_right: int = 3) -> Tuple[pd.Series, pd.Series]:
@@ -1863,6 +1926,18 @@ def summarize_hits(pred_win: List[int], pred_addl: List[int] | int, actual_win: 
     return hit_count, addl_hit
 
 
+def parse_number_set_text(value: object, expected_count: int | None = None) -> Tuple[int, ...]:
+    if value is None:
+        return tuple()
+    text = str(value).strip()
+    if not text:
+        return tuple()
+    nums = [int(x) for x in re.findall(r"\d+", text)]
+    if expected_count is not None and len(nums) != int(expected_count):
+        return tuple()
+    return tuple(sorted(nums))
+
+
 def recency_weights_from_draw_date(
     draw_values: np.ndarray,
     date_values: np.ndarray,
@@ -2411,6 +2486,41 @@ def normalize_blend_groups(
         out[k] = float(addl_vals[i])
     out["repel"] = float(np.clip(float(out["repel"]), 0.0, 0.24))
     return out
+
+
+def blend_weight_key(weights: Dict[str, float], decimals: int = 8) -> Tuple[float, ...]:
+    keys = WIN_BLEND_KEYS + ADDL_BLEND_KEYS + ["repel"]
+    return tuple(round(float(weights.get(k, 0.0)), decimals) for k in keys)
+
+
+def dedupe_blend_candidates(
+    candidates: List[Dict[str, float]],
+    win_total: float,
+    addl_total: float,
+    decimals: int = 8,
+) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    seen: set[Tuple[float, ...]] = set()
+    for cand in candidates:
+        norm = normalize_blend_groups(dict(cand), win_total=win_total, addl_total=addl_total)
+        key = blend_weight_key(norm, decimals=decimals)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(norm)
+    return out
+
+
+def auto_parallel_workers(requested: int, cap: int = 0) -> int:
+    workers = int(requested)
+    auto_max = int(max(1, (os.cpu_count() or 4) - 1))
+    if int(cap) > 0:
+        auto_max = int(min(auto_max, int(cap)))
+    if workers <= 0:
+        workers = auto_max
+    elif int(cap) > 0:
+        workers = int(min(workers, auto_max))
+    return max(1, workers)
 
 
 def coordinate_ascent_blend_search(
@@ -3531,23 +3641,31 @@ def run_backtest(
             )
             local_random = int(max(64, local_random_candidates if local_random_candidates > 0 else (560 if focus_last_n > 0 else 260)))
             heartbeat_every = int(max(1, backtest_progress_every))
-            workers = int(backtest_parallel_workers)
-            if workers <= 0:
-                workers = int(min(8, max(1, (os.cpu_count() or 4) - 1)))
-
-            cand_pool = generate_backtest_blend_candidates(blend_weights, num_random=local_random)
+            workers = auto_parallel_workers(int(backtest_parallel_workers), cap=0)
+            win_total = float(sum(float(blend_weights.get(k, 0.0)) for k in WIN_BLEND_KEYS))
+            addl_total = float(sum(float(blend_weights.get(k, 0.0)) for k in ADDL_BLEND_KEYS))
+            cand_pool = dedupe_blend_candidates(
+                generate_backtest_blend_candidates(blend_weights, num_random=local_random),
+                win_total=win_total,
+                addl_total=addl_total,
+            )
             n_cands = len(cand_pool)
             print(
                 "[BACKTEST-BLEND] "
                 f"candidates={n_cands}, payloads={len(payloads)}, workers={workers}, heartbeat_every={heartbeat_every}"
             )
 
-            def _score_blend_candidate(cand: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
+            def _score_blend_candidate(
+                cand: Dict[str, float],
+                eval_payloads: List[Dict[str, object]],
+                eval_weights: np.ndarray | None,
+                use_tail_bonus: bool,
+            ) -> Tuple[float, Dict[str, float]]:
                 hits: List[int] = []
                 addl_hits: List[int] = []
                 recent_pred_sets: List[Tuple[int, ...]] = []
                 recent_pred_addl_sets: List[Tuple[int, ...]] = []
-                for item in payloads:
+                for item in eval_payloads:
                     pred_win, pred_addl = _predict_for_target_row(
                         pred_pack=item["pred_pack"],
                         target_row=int(item["target_row"]),
@@ -3563,12 +3681,8 @@ def run_backtest(
 
                 hits_arr = np.asarray(hits, dtype=np.float32)
                 addl_arr = np.asarray(addl_hits, dtype=np.float32)
-                m = hit_metrics_from_arrays(hits_arr, addl_arr, sample_weights=payload_recency_w)
-                tail_n = int(min(max(0, latest_priority_n), len(hits_arr)))
-                if tail_n > 0:
-                    tail_m = hit_metrics_from_arrays(hits_arr[-tail_n:], addl_arr[-tail_n:])
-                else:
-                    tail_m = empty_hit_metrics()
+                sw = eval_weights if eval_weights is not None and len(eval_weights) == len(hits_arr) else None
+                m = hit_metrics_from_arrays(hits_arr, addl_arr, sample_weights=sw)
                 if bool(optimize_avg):
                     score = (
                         210.0 * float(m["avg_win_hits"])
@@ -3577,15 +3691,21 @@ def run_backtest(
                         + 52.0 * float(m["p_hit_ge4"])
                         + 6.0 * float(m["addl_acc"])
                     )
-                    # Strongly favor the latest N draws (especially latest 5 by default).
-                    tail_score = (
-                        300.0 * float(tail_m["avg_win_hits"])
-                        + 140.0 * float(tail_m["p_hit_ge2"])
-                        + 120.0 * float(tail_m["p_hit_ge3"])
-                        + 84.0 * float(tail_m["p_hit_ge4"])
-                    )
-                    score += float(latest_priority_lambda) * tail_score
-                    score += float(latest_priority_addl_lambda) * (120.0 * float(tail_m["addl_acc"]))
+                    if use_tail_bonus:
+                        tail_n = int(min(max(0, latest_priority_n), len(hits_arr)))
+                        if tail_n > 0:
+                            tail_m = hit_metrics_from_arrays(hits_arr[-tail_n:], addl_arr[-tail_n:])
+                        else:
+                            tail_m = empty_hit_metrics()
+                        # Strongly favor the latest N draws (especially latest 5 by default).
+                        tail_score = (
+                            300.0 * float(tail_m["avg_win_hits"])
+                            + 140.0 * float(tail_m["p_hit_ge2"])
+                            + 120.0 * float(tail_m["p_hit_ge3"])
+                            + 84.0 * float(tail_m["p_hit_ge4"])
+                        )
+                        score += float(latest_priority_lambda) * tail_score
+                        score += float(latest_priority_addl_lambda) * (120.0 * float(tail_m["addl_acc"]))
                 else:
                     score = blend_objective(
                         {
@@ -3599,34 +3719,99 @@ def run_backtest(
                     )
                 return float(score), dict(cand)
 
-            if workers <= 1 or n_cands <= 12:
-                for idx, cand in enumerate(cand_pool, start=1):
-                    score, scored_cand = _score_blend_candidate(cand)
-                    if score > best_score:
-                        best_score = score
-                        best_weights = scored_cand
-                    if idx % heartbeat_every == 0 or idx == n_cands:
-                        print(f"[BACKTEST-BLEND] progress {idx}/{n_cands}, best_score={best_score:.6f}")
-            else:
+            def _score_candidate_list(
+                candidates: List[Dict[str, float]],
+                eval_payloads: List[Dict[str, object]],
+                eval_weights: np.ndarray | None,
+                use_tail_bonus: bool,
+                stage_label: str,
+            ) -> List[Tuple[float, Dict[str, float]]]:
+                scored: List[Tuple[float, Dict[str, float]]] = []
+                total = len(candidates)
+                if workers <= 1 or total <= 12:
+                    for idx, cand in enumerate(candidates, start=1):
+                        scored.append(
+                            _score_blend_candidate(
+                                cand=cand,
+                                eval_payloads=eval_payloads,
+                                eval_weights=eval_weights,
+                                use_tail_bonus=use_tail_bonus,
+                            )
+                        )
+                        if idx % heartbeat_every == 0 or idx == total:
+                            print(f"[BACKTEST-BLEND:{stage_label}] progress {idx}/{total}")
+                    return scored
+
+                chunk_size = int(max(8, math.ceil(total / max(1, workers * 6))))
+                chunks = [candidates[i : i + chunk_size] for i in range(0, total, chunk_size)]
                 completed = 0
+                last_report = 0
+
+                def _score_chunk(chunk: List[Dict[str, float]]) -> List[Tuple[float, Dict[str, float]]]:
+                    out_chunk: List[Tuple[float, Dict[str, float]]] = []
+                    for cand in chunk:
+                        out_chunk.append(
+                            _score_blend_candidate(
+                                cand=cand,
+                                eval_payloads=eval_payloads,
+                                eval_weights=eval_weights,
+                                use_tail_bonus=use_tail_bonus,
+                            )
+                        )
+                    return out_chunk
+
                 with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures = [ex.submit(_score_blend_candidate, cand) for cand in cand_pool]
+                    futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
                     for fut in as_completed(futures):
-                        completed += 1
+                        chunk_len = int(futures[fut])
+                        completed += chunk_len
                         try:
-                            score, scored_cand = fut.result()
-                            if score > best_score:
-                                best_score = score
-                                best_weights = scored_cand
+                            scored.extend(fut.result())
                         except Exception as exc:
-                            if completed % heartbeat_every == 0 or completed == n_cands:
-                                print(
-                                    f"[BACKTEST-BLEND] progress {completed}/{n_cands}, "
-                                    f"best_score={best_score:.6f}, last_error={exc}"
-                                )
+                            if (completed - last_report) >= heartbeat_every or completed >= total:
+                                print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}, last_error={exc}")
+                                last_report = completed
                             continue
-                        if completed % heartbeat_every == 0 or completed == n_cands:
-                            print(f"[BACKTEST-BLEND] progress {completed}/{n_cands}, best_score={best_score:.6f}")
+                        if (completed - last_report) >= heartbeat_every or completed >= total:
+                            print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}")
+                            last_report = completed
+                return scored
+
+            eval_candidates = cand_pool
+            if bool(optimize_avg) and n_cands >= 640 and len(payloads) >= 10:
+                prescreen_n = int(min(len(payloads), max(6, latest_priority_n + 2)))
+                keep_ratio = 0.30
+                keep_n = int(max(128, min(n_cands, round(n_cands * keep_ratio))))
+                stage1_payloads = payloads[-prescreen_n:]
+                stage1_weights = payload_recency_w[-prescreen_n:]
+                print(
+                    "[BACKTEST-BLEND] "
+                    f"prescreen latest={prescreen_n}, keep={keep_n}/{n_cands}, tail_bonus=N"
+                )
+                stage1_scored = _score_candidate_list(
+                    candidates=cand_pool,
+                    eval_payloads=stage1_payloads,
+                    eval_weights=stage1_weights,
+                    use_tail_bonus=False,
+                    stage_label="prescreen",
+                )
+                stage1_scored.sort(key=lambda x: x[0], reverse=True)
+                eval_candidates = [cand for _, cand in stage1_scored[:keep_n]]
+                print(f"[BACKTEST-BLEND] full-eval candidates after prescreen: {len(eval_candidates)}")
+
+            scored_full = _score_candidate_list(
+                candidates=eval_candidates,
+                eval_payloads=payloads,
+                eval_weights=payload_recency_w,
+                use_tail_bonus=True,
+                stage_label="full",
+            )
+            scored_full.sort(key=lambda x: x[0], reverse=True)
+            if scored_full:
+                best_score, best_weights = scored_full[0]
+            else:
+                best_score = -1e12
+                best_weights = dict(blend_weights)
 
             recent_pred_sets: List[Tuple[int, ...]] = []
             recent_pred_addl_sets: List[Tuple[int, ...]] = []
@@ -4048,14 +4233,11 @@ def build_single_html_report(
   <div class="card">
     <h2>Interactive Charts</h2>
     <div class="chart-grid">
-      <div class="chart-panel"><div id="cluster_scatter" class="plotly"></div></div>
-      <div class="chart-panel"><div id="cluster_timeline" class="plotly"></div></div>
-      <div class="chart-panel"><div id="cluster_profile" class="plotly"></div></div>
-      <div class="chart-panel"><div id="transition_heat" class="plotly"></div></div>
-      <div class="chart-panel"><div id="tuning_plot" class="plotly"></div></div>
       <div class="chart-panel"><div id="train_curve" class="plotly"></div></div>
       <div class="chart-panel"><div id="backtest_hist" class="plotly"></div></div>
       <div class="chart-panel"><div id="backtest_trend" class="plotly"></div></div>
+      <div class="chart-panel"><div id="consensus_bar" class="plotly"></div></div>
+      <div class="chart-panel"><div id="score_heatmap" class="plotly"></div></div>
     </div>
   </div>
 
@@ -4122,78 +4304,6 @@ def build_single_html_report(
       margin: {{l: 52, r: 18, t: 42, b: 42}},
     }};
 
-    Plotly.newPlot('cluster_scatter', [{{
-      x: D.cluster.scatter_x,
-      y: D.cluster.scatter_y,
-      mode: 'markers',
-      type: 'scattergl',
-      marker: {{
-        color: D.cluster.labels,
-        colorscale: 'Turbo',
-        size: 6,
-        opacity: 0.85,
-        showscale: true,
-        colorbar: {{title: 'Cluster'}}
-      }},
-      text: D.cluster.draw_labels
-    }}], {{...baseLayout, title: 'Cluster Shape Map (PCA)'}}, {{responsive:true}});
-
-    Plotly.newPlot('cluster_timeline', [{{
-      x: D.cluster.timeline_x,
-      y: D.cluster.labels,
-      mode: 'lines+markers',
-      line: {{color: '#60a5fa', width: 1}},
-      marker: {{size: 4, color: D.cluster.labels, colorscale: 'Turbo'}},
-      type: 'scattergl'
-    }}], {{...baseLayout, title: 'Cluster Timeline (Oldest -> Newest)', xaxis:{{title:'Index'}}, yaxis:{{title:'Cluster'}}}}, {{responsive:true}});
-
-    Plotly.newPlot('cluster_profile', [{{
-      z: D.cluster.profile_z,
-      x: D.cluster.profile_x,
-      y: D.cluster.profile_y,
-      type: 'heatmap',
-      colorscale: 'Viridis'
-    }}], {{...baseLayout, title:'Cluster Pattern Heatmap (Win Columns Focus)'}}, {{responsive:true}});
-
-    Plotly.newPlot('transition_heat', [{{
-      z: D.cluster.transition_z,
-      x: D.cluster.transition_x,
-      y: D.cluster.transition_y,
-      type: 'heatmap',
-      colorscale: 'Magma'
-    }}], {{...baseLayout, title:'Cluster Transition Probability Matrix'}}, {{responsive:true}});
-
-    Plotly.newPlot('tuning_plot', [
-      {{
-        x: D.tuning.trial,
-        y: D.tuning.p_hit_ge2,
-        mode: 'lines+markers',
-        name: 'P(hit>=2)',
-        line: {{color:'#f59e0b', width:2}}
-      }},
-      {{
-        x: D.tuning.trial,
-        y: D.tuning.p_hit_ge3,
-        mode: 'lines+markers',
-        name: 'P(hit>=3)',
-        line: {{color:'#34d399', width:2}}
-      }},
-      {{
-        x: D.tuning.trial,
-        y: D.tuning.avg_hits,
-        mode: 'lines+markers',
-        name: 'Avg Win Hits',
-        line: {{color:'#60a5fa', width:2}},
-        yaxis: 'y2'
-      }}
-    ], {{
-      ...baseLayout,
-      title:'Tuning Objective Landscape',
-      yaxis: {{title:'P(hit>=3)'}},
-      yaxis2: {{title:'Avg Hits', overlaying:'y', side:'right'}},
-      xaxis: {{title:'Trial'}}
-    }}, {{responsive:true}});
-
     Plotly.newPlot('train_curve', [
       {{x: D.training.epoch, y: D.training.train_loss, mode:'lines', name:'train_loss', line:{{color:'#f59e0b'}}}},
       {{x: D.training.epoch, y: D.training.val_loss, mode:'lines', name:'val_loss', line:{{color:'#ef4444'}}}}
@@ -4223,6 +4333,21 @@ def build_single_html_report(
       }}
     ], {{...baseLayout, title:'Backtest Hit Trend{" (Last " + str(focus_last_n) + ")" if focus_last_n > 0 else ""}', xaxis:{{title:'Sample'}}, yaxis:{{title:'Hit Count'}}}}, {{responsive:true}});
 
+    Plotly.newPlot('consensus_bar', [{{
+      x: D.consensus.numbers,
+      y: D.consensus.weighted_counts,
+      type:'bar',
+      marker:{{color:'#38bdf8'}}
+    }}], {{...baseLayout, title:'Consensus Frequency (Top 20 Numbers)', xaxis:{{title:'Number'}}, yaxis:{{title:'Weighted Count'}}}}, {{responsive:true}});
+
+    Plotly.newPlot('score_heatmap', [{{
+      z: D.scoremap.z,
+      x: D.scoremap.x,
+      y: D.scoremap.y,
+      type:'heatmap',
+      colorscale:'Viridis'
+    }}], {{...baseLayout, title:'Recency-Weighted Number Score Heatmap', xaxis:{{title:'Number (1..49)'}}, yaxis:{{title:'Component'}}}}, {{responsive:true}});
+
   </script>
 </body>
 </html>"""
@@ -4232,6 +4357,7 @@ def build_single_html_report(
 
 
 def main() -> None:
+    enable_timestamped_print()
     args = parse_args()
     set_global_seed(int(args.seed))
     stage_times: Dict[str, float] = {}
@@ -4346,35 +4472,35 @@ def main() -> None:
     if bool(args.avg_hit_focused):
         prev_backtest_opt = bool(args.backtest_optimize_avg)
         args.backtest_optimize_avg = True
-        # Anchor avg-focus defaults to best observed profile:
-        # run_01_L01_base_lowanti (avg_win_hits=1.5000).
+        # Anchor avg-focus defaults to the stronger region observed in
+        # g12_prod_sweep_20260317_134345 (top runs by avg_win_hits).
         args.w_graph = _profile_or_clip(args.w_graph, default=1.6, profile=1.90, lo=1.60)
         args.w_cluster = _profile_or_clip(args.w_cluster, default=1.35, profile=1.00, lo=0.70, hi=1.35)
-        args.reward_a = _profile_or_clip(args.reward_a, default=1.0, profile=2.00, lo=1.70, hi=2.40)
-        args.reward_b = _profile_or_clip(args.reward_b, default=2.4, profile=2.30, lo=1.80, hi=2.80)
+        args.reward_a = _profile_or_clip(args.reward_a, default=1.0, profile=1.90, lo=1.70, hi=2.20)
+        args.reward_b = _profile_or_clip(args.reward_b, default=2.4, profile=2.70, lo=1.90, hi=2.80)
         args.reward_c = _profile_or_clip(args.reward_c, default=6.8, profile=4.60, lo=3.60, hi=5.80)
         args.reward_scale = _profile_or_clip(args.reward_scale, default=0.55, profile=0.55, lo=0.45, hi=0.70)
         args.anti_repeat_window = _profile_or_floor_int(args.anti_repeat_window, default_max=10, profile=12, floor=10)
-        args.anti_repeat_lambda = _profile_or_clip(args.anti_repeat_lambda, default=1.25, profile=0.55, lo=0.45, hi=1.10)
+        args.anti_repeat_lambda = _profile_or_clip(args.anti_repeat_lambda, default=1.25, profile=0.90, lo=0.45, hi=1.10)
         args.candidate_diversity_lambda = _profile_or_clip(
-            args.candidate_diversity_lambda, default=0.11, profile=0.08, lo=0.05, hi=0.16
+            args.candidate_diversity_lambda, default=0.11, profile=0.10, lo=0.05, hi=0.16
         )
         args.candidate_max_pool = _profile_or_floor_int(args.candidate_max_pool, default_max=48, profile=72, floor=48)
         args.candidate_gumbel_samples = _profile_or_floor_int(args.candidate_gumbel_samples, default_max=28, profile=52, floor=28)
         args.expected_hit_rerank = True
-        args.expected_hit_lambda = _profile_or_clip(args.expected_hit_lambda, default=2.20, profile=2.80, lo=2.20, hi=3.40)
+        args.expected_hit_lambda = _profile_or_clip(args.expected_hit_lambda, default=2.20, profile=2.65, lo=2.20, hi=3.10)
         args.expected_hit_synergy_lambda = _profile_or_clip(
-            args.expected_hit_synergy_lambda, default=0.48, profile=0.72, lo=0.40, hi=1.00
+            args.expected_hit_synergy_lambda, default=0.48, profile=0.55, lo=0.40, hi=0.85
         )
         args.latest_priority_n = _profile_or_floor_int(args.latest_priority_n, default_max=5, profile=5, floor=3)
         args.latest_priority_boost = _profile_or_clip(
-            args.latest_priority_boost, default=3.4, profile=4.2, lo=2.6, hi=7.0
+            args.latest_priority_boost, default=3.4, profile=3.8, lo=2.6, hi=5.2
         )
         args.latest_priority_lambda = _profile_or_clip(
-            args.latest_priority_lambda, default=2.2, profile=2.9, lo=1.4, hi=5.0
+            args.latest_priority_lambda, default=2.2, profile=2.4, lo=1.4, hi=4.2
         )
         args.latest_priority_addl_lambda = _profile_or_clip(
-            args.latest_priority_addl_lambda, default=1.6, profile=2.3, lo=0.9, hi=4.0
+            args.latest_priority_addl_lambda, default=1.6, profile=1.4, lo=0.9, hi=2.6
         )
         print(
             "[AVG-FOCUS] enabled: "
@@ -4393,6 +4519,10 @@ def main() -> None:
             "[AVG-FOCUS] objective override: using avg-oriented tuning/restart/blend scoring "
             "(tail-hit objective disabled for model selection)"
         )
+    req_pri = str(args.process_priority).strip().lower()
+    if req_pri == "auto":
+        req_pri = "high" if str(args.perf_mode).strip().lower() == "high" else "normal"
+    applied_pri = set_windows_process_priority(req_pri)
     csv_path = Path(args.csv)
     if not csv_path.exists():
         raise FileNotFoundError(f"Input CSV not found: {csv_path}")
@@ -4409,6 +4539,7 @@ def main() -> None:
     print(f"Seed: {args.seed}")
     print(f"Input CSV: {csv_path}")
     print(f"Output HTML: {html_path}")
+    print(f"Process Priority: requested={req_pri} applied={applied_pri}")
 
     hw = configure_hardware(
         preallocate_gpu=bool(args.gpu_preallocate),
@@ -4752,9 +4883,23 @@ def main() -> None:
     blend_candidates.extend(generate_backtest_blend_candidates(calibrated_blend, num_random=int(args.blend_random_candidates)))
     # Keep a few hand-crafted variants as fallback.
     blend_candidates.extend(generate_blend_candidates(calibrated_blend))
-    best_blend_score = -1e9
+    blend_win_total = float(sum(float(calibrated_blend.get(k, 0.0)) for k in WIN_BLEND_KEYS))
+    blend_addl_total = float(sum(float(calibrated_blend.get(k, 0.0)) for k in ADDL_BLEND_KEYS))
+    blend_candidates = dedupe_blend_candidates(
+        blend_candidates,
+        win_total=blend_win_total,
+        addl_total=blend_addl_total,
+    )
+    blend_workers = auto_parallel_workers(int(args.backtest_parallel_workers), cap=0)
+    blend_heartbeat_every = int(max(8, int(args.backtest_progress_every)))
     blend_focused = objective_hit_focused
-    for cand in blend_candidates:
+    best_blend_score = -1e9
+
+    def _blend_eval_once(
+        cand: Dict[str, float],
+        candidate_max_pool: int,
+        candidate_gumbel_samples: int,
+    ) -> Tuple[float, Dict[str, float], Dict[str, float]]:
         val_hit_metrics = evaluate_hit_score(
             model=model,
             scaler_x=scaler_x,
@@ -4771,8 +4916,8 @@ def main() -> None:
             sample_weights=blend_eval_weights,
             cached_preds=blend_eval_preds,
             dynamic_blend=bool(args.uncertainty_dynamic_blend),
-            candidate_max_pool=int(args.candidate_max_pool),
-            candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+            candidate_max_pool=int(candidate_max_pool),
+            candidate_gumbel_samples=int(candidate_gumbel_samples),
             candidate_diversity_lambda=float(args.candidate_diversity_lambda),
             expected_hit_rerank=bool(args.expected_hit_rerank),
             expected_hit_lambda=float(args.expected_hit_lambda),
@@ -4780,14 +4925,91 @@ def main() -> None:
             anti_repeat_window=int(args.anti_repeat_window),
             anti_repeat_lambda=float(args.anti_repeat_lambda),
         )
-        blend_score = blend_objective(val_hit_metrics, focused=blend_focused)
-        if blend_score > best_blend_score:
-            best_blend_score = blend_score
-            selected_blend = dict(cand)
-            selected_blend_metrics = val_hit_metrics
+        blend_score = float(blend_objective(val_hit_metrics, focused=blend_focused))
+        return blend_score, val_hit_metrics, dict(cand)
+
+    def _score_blend_candidates(
+        candidates: List[Dict[str, float]],
+        candidate_max_pool: int,
+        candidate_gumbel_samples: int,
+        stage: str,
+    ) -> List[Tuple[float, Dict[str, float], Dict[str, float]]]:
+        scored: List[Tuple[float, Dict[str, float], Dict[str, float]]] = []
+        total = len(candidates)
+        if blend_workers <= 1 or total <= 12:
+            for idx, cand in enumerate(candidates, start=1):
+                scored.append(_blend_eval_once(cand, candidate_max_pool, candidate_gumbel_samples))
+                if idx % blend_heartbeat_every == 0 or idx == total:
+                    print(f"[BLEND-SEARCH:{stage}] progress {idx}/{total}")
+            return scored
+
+        chunk_size = int(max(8, math.ceil(total / max(1, blend_workers * 6))))
+        chunks = [candidates[i : i + chunk_size] for i in range(0, total, chunk_size)]
+        completed = 0
+        last_report = 0
+
+        def _score_chunk(chunk: List[Dict[str, float]]) -> List[Tuple[float, Dict[str, float], Dict[str, float]]]:
+            out_chunk: List[Tuple[float, Dict[str, float], Dict[str, float]]] = []
+            for cand in chunk:
+                out_chunk.append(_blend_eval_once(cand, candidate_max_pool, candidate_gumbel_samples))
+            return out_chunk
+
+        with ThreadPoolExecutor(max_workers=blend_workers) as ex:
+            futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
+            for fut in as_completed(futures):
+                chunk_len = int(futures[fut])
+                completed += chunk_len
+                try:
+                    scored.extend(fut.result())
+                except Exception as exc:
+                    if (completed - last_report) >= blend_heartbeat_every or completed >= total:
+                        print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}, last_error={exc}")
+                        last_report = completed
+                    continue
+                if (completed - last_report) >= blend_heartbeat_every or completed >= total:
+                    print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}")
+                    last_report = completed
+        return scored
+
+    eval_candidates = blend_candidates
+    if len(blend_candidates) >= 900:
+        prescreen_pool = max(20, int(round(float(args.candidate_max_pool) * 0.55)))
+        prescreen_gumbel = max(10, int(round(float(args.candidate_gumbel_samples) * 0.5)))
+        keep_ratio = 0.36
+        keep_n = int(max(280, min(len(blend_candidates), round(len(blend_candidates) * keep_ratio))))
+        print(
+            "[BLEND-SEARCH] "
+            f"prescreen candidates={len(blend_candidates)}, keep={keep_n}, pool={prescreen_pool}, gumbel={prescreen_gumbel}"
+        )
+        prescored = _score_blend_candidates(
+            candidates=blend_candidates,
+            candidate_max_pool=prescreen_pool,
+            candidate_gumbel_samples=prescreen_gumbel,
+            stage="prescreen",
+        )
+        prescored.sort(key=lambda x: x[0], reverse=True)
+        eval_candidates = [cand for _, _, cand in prescored[:keep_n]]
+        print(f"[BLEND-SEARCH] full-eval candidates after prescreen: {len(eval_candidates)}")
+
+    scored_candidates = _score_blend_candidates(
+        candidates=eval_candidates,
+        candidate_max_pool=int(args.candidate_max_pool),
+        candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+        stage="full",
+    )
+    scored_candidates.sort(key=lambda x: x[0], reverse=True)
+    if scored_candidates:
+        best_blend_score, selected_blend_metrics, selected_blend = scored_candidates[0]
 
     def eval_blend_metrics(cand: Dict[str, float]) -> Dict[str, float]:
-        return evaluate_hit_score(
+        eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = getattr(eval_blend_metrics, "_cache", {})
+        key = blend_weight_key(
+            normalize_blend_groups(dict(cand), win_total=blend_win_total, addl_total=blend_addl_total),
+            decimals=8,
+        )
+        if key in eval_cache:
+            return eval_cache[key]
+        metrics = evaluate_hit_score(
             model=model,
             scaler_x=scaler_x,
             X_seq=X_seq,
@@ -4812,6 +5034,9 @@ def main() -> None:
             anti_repeat_window=int(args.anti_repeat_window),
             anti_repeat_lambda=float(args.anti_repeat_lambda),
         )
+        eval_cache[key] = metrics
+        setattr(eval_blend_metrics, "_cache", eval_cache)
+        return metrics
 
     selected_blend, selected_blend_metrics, best_blend_score = coordinate_ascent_blend_search(
         start_weights=selected_blend,
@@ -4955,6 +5180,19 @@ def main() -> None:
 
     latest_seq = scaler_x.transform(X_seq[-1].reshape(-1, n_features)).reshape(1, X_seq.shape[1], n_features).astype(np.float32)
     pred_latest = predict_outputs_dict(model, latest_seq)
+    recent_final_pred_sets: List[Tuple[int, ...]] = []
+    recent_final_pred_addl_sets: List[Tuple[int, ...]] = []
+    if not backtest_df.empty:
+        if "pred_win" in backtest_df.columns:
+            for txt in backtest_df["pred_win"].astype(str).tail(max(1, int(args.anti_repeat_window))).tolist():
+                key = parse_number_set_text(txt, expected_count=PRED_WIN_COUNT)
+                if key:
+                    recent_final_pred_sets.append(key)
+        if "pred_addl" in backtest_df.columns:
+            for txt in backtest_df["pred_addl"].astype(str).tail(max(1, int(args.anti_repeat_window))).tolist():
+                key = parse_number_set_text(txt, expected_count=PRED_ADDL_COUNT)
+                if key:
+                    recent_final_pred_addl_sets.append(key)
     pred_win, pred_addl = combine_prediction(
         pred=pred_latest,
         win_cluster_prior=win_cluster_next_prior,
@@ -4970,8 +5208,19 @@ def main() -> None:
         expected_hit_rerank=bool(args.expected_hit_rerank),
         expected_hit_lambda=float(args.expected_hit_lambda),
         expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+        recent_pred_sets=recent_final_pred_sets,
+        recent_pred_addl_sets=recent_final_pred_addl_sets,
         anti_repeat_window=int(args.anti_repeat_window),
         anti_repeat_lambda=float(args.anti_repeat_lambda),
+    )
+    combined_win_dbg, _combined_addl_dbg, model_soft_dbg, graph_dbg, embed_dbg, cluster_dbg, _repel_dbg, _model_conf_dbg = build_combined_distributions(
+        pred=pred_latest,
+        win_cluster_prior=win_cluster_next_prior,
+        graph_prior=normalize_prob(graph_prior_matrix[-1]),
+        embed_prior=embed_next_prior,
+        repel_prior=repel_next_prior,
+        weights=selected_blend,
+        dynamic_blend=bool(args.uncertainty_dynamic_blend),
     )
 
     pred_stats = {
@@ -5002,30 +5251,73 @@ def main() -> None:
         backtest_rolling = backtest_df["win_hits"].rolling(rolling_win, min_periods=1).mean().astype(float).tolist()
         backtest_idx = list(range(len(backtest_df)))
 
+    # Consensus bar: recency-weighted frequency of predicted numbers in backtest (+ latest prediction).
+    consensus_counts = np.zeros(49, dtype=np.float64)
+    bt_weights = np.ones(0, dtype=np.float64)
+    if not backtest_df.empty and "pred_win" in backtest_df.columns:
+        bt_n = int(len(backtest_df))
+        bt_weights = recency_weights_from_draw_date(
+            backtest_df["draw"].values.astype(object),
+            backtest_df["date"].values.astype(object),
+            np.arange(bt_n, dtype=np.float64),
+        )
+        bt_weights = emphasize_latest_weights(
+            bt_weights,
+            latest_n=int(args.latest_priority_n),
+            boost=float(args.latest_priority_boost),
+            power=1.9,
+        )
+        for i, txt in enumerate(backtest_df["pred_win"].astype(str).tolist()):
+            key = parse_number_set_text(txt, expected_count=PRED_WIN_COUNT)
+            if not key:
+                continue
+            w = float(bt_weights[i]) if i < len(bt_weights) else 1.0
+            for n in key:
+                if 1 <= int(n) <= 49:
+                    consensus_counts[int(n) - 1] += w
+    final_bonus = float(np.mean(bt_weights) if len(bt_weights) > 0 else 1.0)
+    for n in pred_win:
+        if 1 <= int(n) <= 49:
+            consensus_counts[int(n) - 1] += final_bonus
+    top_n = int(min(20, max(1, np.count_nonzero(consensus_counts > 0))))
+    if top_n <= 0:
+        top_n = 10
+        consensus_counts[np.asarray(pred_win, dtype=np.int32) - 1] += 1.0
+    top_idx = np.argsort(consensus_counts)[-top_n:][::-1]
+    consensus_numbers = (top_idx + 1).astype(int).tolist()
+    consensus_weighted_counts = consensus_counts[top_idx].astype(float).tolist()
+
+    # Recency-weighted score heatmap (components vs number 1..49).
+    hist_weights = recency_weights_from_draw_date(
+        df["Draw"].values.astype(object),
+        df["Date"].values.astype(object),
+        np.arange(len(df), dtype=np.float64),
+    )
+    hist_weights = emphasize_latest_weights(
+        hist_weights,
+        latest_n=int(args.latest_priority_n),
+        boost=float(args.latest_priority_boost),
+        power=1.6,
+    )
+    recency_counts = np.zeros(49, dtype=np.float64)
+    for i, row in enumerate(df[WIN_COLS].values.astype(int)):
+        w = float(hist_weights[i]) if i < len(hist_weights) else 1.0
+        for n in row:
+            if 1 <= int(n) <= 49:
+                recency_counts[int(n) - 1] += w
+    recency_prob = normalize_prob(recency_counts)
+    scoremap_x = list(range(1, 50))
+    scoremap_y = ["combined", "model_soft", "graph", "embed", "cluster", "recency"]
+    scoremap_z = [
+        combined_win_dbg.astype(float).tolist(),
+        model_soft_dbg.astype(float).tolist(),
+        graph_dbg.astype(float).tolist(),
+        embed_dbg.astype(float).tolist(),
+        cluster_dbg.astype(float).tolist(),
+        recency_prob.astype(float).tolist(),
+    ]
+
     dashboard = {
-        "cluster": {
-            "scatter_x": embedding[:, 0].astype(float).tolist(),
-            "scatter_y": embedding[:, 1].astype(float).tolist(),
-            "labels": cluster_labels.astype(int).tolist(),
-            "draw_labels": [
-                str(int(v)) if not pd.isna(v) else str(i)
-                for i, v in enumerate(df["Draw"].tolist())
-            ],
-            "timeline_x": list(range(len(cluster_labels))),
-            "profile_z": cluster_profile_means.values.astype(float).tolist(),
-            "profile_x": cluster_profile_means.columns.tolist(),
-            "profile_y": [str(x) for x in cluster_profile_means.index.tolist()],
-            "transition_z": transition_matrix.astype(float).tolist(),
-            "transition_x": [f"to_{i}" for i in range(transition_matrix.shape[1])],
-            "transition_y": [f"from_{i}" for i in range(transition_matrix.shape[0])],
-        },
-        "tuning": {
-            "trial": tuning_df["trial"].astype(int).tolist(),
-            "p_hit_ge2": tuning_df["mean_val_p_hit_ge2"].astype(float).tolist(),
-            "p_hit_ge3": tuning_df["mean_val_p_hit_ge3"].astype(float).tolist(),
-            "avg_hits": tuning_df["mean_val_avg_hits"].astype(float).tolist(),
-            "loss": tuning_df["mean_val_loss"].astype(float).tolist(),
-        },
         "training": {
             "epoch": history_epoch,
             "train_loss": history_loss,
@@ -5035,6 +5327,15 @@ def main() -> None:
             "index": backtest_idx,
             "win_hits": backtest_hits,
             "rolling": backtest_rolling,
+        },
+        "consensus": {
+            "numbers": consensus_numbers,
+            "weighted_counts": consensus_weighted_counts,
+        },
+        "scoremap": {
+            "x": scoremap_x,
+            "y": scoremap_y,
+            "z": scoremap_z,
         },
     }
 
@@ -5065,6 +5366,11 @@ def main() -> None:
     print("Prediction (latest):")
     print(f"Win: {pred_win}")
     print(f"Addl: {pred_addl}")
+    print(
+        "[FINAL-PRED] anti-repeat history used: "
+        f"win_sets={len(recent_final_pred_sets)}, addl_sets={len(recent_final_pred_addl_sets)}, "
+        f"window={int(args.anti_repeat_window)}, lambda={float(args.anti_repeat_lambda):.2f}"
+    )
     print("")
     print("Backtest summary:")
     print(backtest_summary)

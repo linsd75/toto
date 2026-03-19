@@ -225,6 +225,8 @@ def build_cmd(
         "--sweep-mode",
         "--focus-last-n",
         "24",
+        "--process-priority",
+        "high",
         "--latest-priority-n",
         "5",
         "--gpu-preallocate",
@@ -432,7 +434,6 @@ def main() -> None:
         final_cmd = build_cmd(py=py, train_py=train_py, csv_path=args.csv, html_path=final_html, cfg=best_cfg)
         # Upgrade to true production pass on best config.
         final_cmd += [
-            "--no-sweep-mode",
             "--tune-trials",
             str(max(10, best_cfg.tune_trials + 2)),
             "--tune-epochs",
