@@ -86,7 +86,7 @@ from sklearn.preprocessing import StandardScaler
 from tensorflow import keras
 from tensorflow.keras import layers
 
-SEED = 42
+SEED = 236
 ACTIVE_SEED = SEED
 
 
@@ -123,9 +123,9 @@ DEFAULT_FEATURE_GROUP_WEIGHTS = {
     "primary": 4.0,
     "other": 1.25,
     "repel": 1.20,
-    "cluster": 1.35,
-    "graph": 1.60,
-    "embed": 1.45,
+    "cluster": 1.30,
+    "graph": 1.70,
+    "embed": 1.80,
 }
 
 
@@ -159,11 +159,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=SEED, help="Global random seed")
     parser.add_argument("--sweep-mode", action="store_true", help="Use lighter settings for automated multi-run sweeps")
-    parser.add_argument("--csv", default="ToTo-17_Mar_2026.csv", help="Input CSV file path")
+    parser.add_argument("--csv", default="ToTo-23_Mar_2026.csv", help="Input CSV file path")
     parser.add_argument("--clusters", type=int, default=0, help="Force KMeans clusters (0=auto)")
-    parser.add_argument("--tune-trials", type=int, default=10, help="Random trials sampled from config space")
+    parser.add_argument("--tune-trials", type=int, default=8, help="Random trials sampled from config space")
     parser.add_argument("--tune-folds", type=int, default=3, help="Walk-forward folds per tuning trial")
-    parser.add_argument("--tune-epochs", type=int, default=10, help="Epoch cap for each tuning fold")
+    parser.add_argument("--tune-epochs", type=int, default=8, help="Epoch cap for each tuning fold")
     parser.add_argument(
         "--tune-multifidelity",
         action=argparse.BooleanOptionalAction,
@@ -172,10 +172,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tune-mf-stage1-epochs", type=int, default=2, help="Epoch cap for stage-1 multi-fidelity tuning")
     parser.add_argument("--tune-mf-keep-ratio", type=float, default=0.50, help="Top ratio kept from stage-1 into full stage-2 tuning")
-    parser.add_argument("--multi-restarts", type=int, default=5, help="Number of final-training restarts (best restart kept by hit objective)")
-    parser.add_argument("--final-epochs", type=int, default=72, help="Final training epoch cap")
+    parser.add_argument("--multi-restarts", type=int, default=3, help="Number of final-training restarts (best restart kept by hit objective)")
+    parser.add_argument("--final-epochs", type=int, default=32, help="Final training epoch cap")
     parser.add_argument("--backtest-folds", type=int, default=24, help="Expanding-window backtest folds")
-    parser.add_argument("--backtest-epochs", type=int, default=20, help="Epoch cap per backtest fold")
+    parser.add_argument("--backtest-epochs", type=int, default=12, help="Epoch cap per backtest fold")
     parser.add_argument(
         "--focus-last-n",
         type=int,
@@ -188,7 +188,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--w-repel", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["repel"], help="Feature weight for repel features")
     parser.add_argument("--w-cluster", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["cluster"], help="Feature weight for cluster-prior features")
     parser.add_argument("--w-graph", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["graph"], help="Feature weight for graph co-occurrence features")
-    parser.add_argument("--w-embed", type=float, default=1.55, help="Feature weight for embedding-pattern features")
+    parser.add_argument("--w-embed", type=float, default=DEFAULT_FEATURE_GROUP_WEIGHTS["embed"], help="Feature weight for embedding-pattern features")
     parser.add_argument("--w-line", dest="w_graph", type=float, default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument(
         "--perf-mode",
@@ -228,20 +228,35 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Auto-increase search depth and recent-window emphasis for hit-score optimization",
     )
-    parser.add_argument("--blend-random-candidates", type=int, default=3200, help="Random blend candidates evaluated before coordinate-ascent refinement")
-    parser.add_argument("--blend-coordinate-iters", type=int, default=16, help="Coordinate-ascent iterations after random blend search")
+    parser.add_argument("--blend-random-candidates", type=int, default=2200, help="Random blend candidates evaluated before coordinate-ascent refinement")
+    parser.add_argument("--blend-coordinate-iters", type=int, default=14, help="Coordinate-ascent iterations after random blend search")
     parser.add_argument("--blend-coordinate-step", type=float, default=0.42, help="Initial coordinate-ascent relative step size")
-    parser.add_argument("--blend-simplex-iters", type=int, default=180, help="Local Nelder-Mead iterations after coordinate-ascent")
+    parser.add_argument("--blend-simplex-iters", type=int, default=140, help="Local Nelder-Mead iterations after coordinate-ascent")
     parser.add_argument("--blend-simplex-step", type=float, default=0.24, help="Initial simplex step size in transformed blend space")
     parser.add_argument("--blend-tail-iters", type=int, default=8, help="Tail-hit local refinement iterations after Nelder-Mead")
     parser.add_argument("--blend-tail-candidates", type=int, default=360, help="Candidates evaluated per tail-hit refinement iteration")
+    parser.add_argument(
+        "--blend-nested-holdout",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use nested holdout split inside recent blend window (optimize on head, pick on tail holdout)",
+    )
+    parser.add_argument("--blend-holdout-size", type=int, default=6, help="Holdout size for nested blend split inside recent window")
+    parser.add_argument(
+        "--blend-adaptive-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable adaptive early-stop for blend candidate scoring when objective plateaus",
+    )
+    parser.add_argument("--blend-early-stop-min-evals", type=int, default=320, help="Minimum candidates to evaluate before blend early-stop can trigger")
+    parser.add_argument("--blend-early-stop-patience", type=int, default=220, help="No-improvement candidate budget before stopping blend scoring")
     parser.add_argument("--backtest-local-random-candidates", type=int, default=2600, help="Local blend random candidates used inside strict walk-forward backtest")
-    parser.add_argument("--backtest-restarts", type=int, default=1, help="Model restarts per walk-forward step (recent-focus mode)")
-    parser.add_argument("--restart-ensemble-topk", type=int, default=1, help="Average top-K restarts per walk-forward step")
+    parser.add_argument("--backtest-restarts", type=int, default=2, help="Model restarts per walk-forward step (recent-focus mode)")
+    parser.add_argument("--restart-ensemble-topk", type=int, default=2, help="Average top-K restarts per walk-forward step")
     parser.add_argument(
         "--backtest-no-retrain",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="Use the final trained model for backtest inference (skip per-step retraining for speed)",
     )
     parser.add_argument(
@@ -253,7 +268,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backtest-parallel-workers",
         type=int,
-        default=18,
+        default=0,
         help="CPU threads for strict backtest blend-candidate scoring (0 = auto)",
     )
     parser.add_argument(
@@ -263,6 +278,14 @@ def parse_args() -> argparse.Namespace:
         help="Heartbeat frequency (candidate count) for strict backtest blend search logs",
     )
     parser.add_argument(
+        "--backtest-adaptive-early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable adaptive early-stop in strict backtest blend candidate scoring",
+    )
+    parser.add_argument("--backtest-early-stop-min-evals", type=int, default=560, help="Minimum candidates evaluated before backtest blend early-stop can trigger")
+    parser.add_argument("--backtest-early-stop-patience", type=int, default=360, help="No-improvement candidate budget before backtest blend early-stop")
+    parser.add_argument(
         "--latest-priority-n",
         type=int,
         default=5,
@@ -271,19 +294,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--latest-priority-boost",
         type=float,
-        default=3.8,
+        default=5.0,
         help="Multiplicative recency boost applied to the latest-priority window",
     )
     parser.add_argument(
         "--latest-priority-lambda",
         type=float,
-        default=2.4,
+        default=2.9,
         help="Extra objective weight on latest-priority win-hit performance during backtest blend search",
     )
     parser.add_argument(
         "--latest-priority-addl-lambda",
         type=float,
-        default=1.4,
+        default=2.0,
         help="Extra objective weight on latest-priority additional-number hit performance",
     )
     parser.add_argument(
@@ -292,19 +315,19 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Apply entropy/temperature-calibrated dynamic per-draw blend weighting",
     )
-    parser.add_argument("--candidate-max-pool", type=int, default=128, help="Maximum unique win-set candidates scored per prediction")
-    parser.add_argument("--candidate-gumbel-samples", type=int, default=96, help="Stochastic Gumbel-top-k candidate samples per prediction")
-    parser.add_argument("--candidate-diversity-lambda", type=float, default=0.10, help="Penalty strength for low-spread candidate sets")
+    parser.add_argument("--candidate-max-pool", type=int, default=104, help="Maximum unique win-set candidates scored per prediction")
+    parser.add_argument("--candidate-gumbel-samples", type=int, default=88, help="Stochastic Gumbel-top-k candidate samples per prediction")
+    parser.add_argument("--candidate-diversity-lambda", type=float, default=0.07, help="Penalty strength for low-spread candidate sets")
     parser.add_argument(
         "--expected-hit-rerank",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Add expected-hit utility term during candidate ranking (avg-hit oriented)",
     )
-    parser.add_argument("--expected-hit-lambda", type=float, default=2.65, help="Weight for expected-hit utility term")
-    parser.add_argument("--expected-hit-synergy-lambda", type=float, default=0.55, help="Weight for component-consensus utility term")
+    parser.add_argument("--expected-hit-lambda", type=float, default=3.40, help="Weight for expected-hit utility term")
+    parser.add_argument("--expected-hit-synergy-lambda", type=float, default=0.82, help="Weight for component-consensus utility term")
     parser.add_argument("--anti-repeat-window", type=int, default=10, help="Recent prediction window used to penalize repeated win sets")
-    parser.add_argument("--anti-repeat-lambda", type=float, default=0.90, help="Penalty strength against repeated/high-overlap predicted win sets")
+    parser.add_argument("--anti-repeat-lambda", type=float, default=1.75, help="Penalty strength against repeated/high-overlap predicted win sets")
     parser.add_argument(
         "--avg-hit-focused",
         action=argparse.BooleanOptionalAction,
@@ -318,9 +341,9 @@ def parse_args() -> argparse.Namespace:
         help="Enable reward-model reranking on candidate win sets",
     )
     parser.add_argument("--reward-window", type=int, default=72, help="Recent tuning rows used to fit reward reranker")
-    parser.add_argument("--reward-a", type=float, default=1.9, help="Reward coefficient for hit count")
-    parser.add_argument("--reward-b", type=float, default=2.7, help="Reward bonus for hits>=3")
-    parser.add_argument("--reward-c", type=float, default=4.6, help="Reward bonus for hits>=4")
+    parser.add_argument("--reward-a", type=float, default=2.2, help="Reward coefficient for hit count")
+    parser.add_argument("--reward-b", type=float, default=3.2, help="Reward bonus for hits>=3")
+    parser.add_argument("--reward-c", type=float, default=8.6, help="Reward bonus for hits>=4")
     parser.add_argument("--reward-hardneg-boost", type=float, default=0.9, help="Extra weight for hard negatives (hits 1-2) in reward fitting")
     parser.add_argument("--reward-ridge", type=float, default=0.18, help="L2 regularization for reward reranker fit")
     parser.add_argument("--reward-scale", type=float, default=0.55, help="Blend scale for reward reranker score at inference time")
@@ -1253,6 +1276,7 @@ def make_dataset(
     shuffle: bool,
     cache: bool = False,
     sample_weights: np.ndarray | None = None,
+    drop_remainder: bool = False,
 ) -> tf.data.Dataset:
     if sample_weights is None:
         ds = tf.data.Dataset.from_tensor_slices((X, y))
@@ -1269,7 +1293,7 @@ def make_dataset(
     opts = tf.data.Options()
     opts.experimental_deterministic = False
     ds = ds.with_options(opts)
-    return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    return ds.batch(batch_size, drop_remainder=bool(drop_remainder)).prefetch(tf.data.AUTOTUNE)
 
 
 def predict_outputs_dict(model: keras.Model, x: np.ndarray) -> Dict[str, np.ndarray]:
@@ -1285,6 +1309,34 @@ def predict_outputs_dict(model: keras.Model, x: np.ndarray) -> Dict[str, np.ndar
     names = list(model.output_names)
     key = names[0] if names else "output_0"
     return {key: np.asarray(out)}
+
+
+def predict_outputs_dict_ensemble(
+    models: List[keras.Model],
+    scalers: List[StandardScaler],
+    x_raw: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """
+    Average prediction outputs across multiple restart models.
+    x_raw is unscaled sequence tensor with shape [N, T, F].
+    """
+    if len(models) == 0 or len(models) != len(scalers):
+        raise ValueError("Ensemble requires non-empty model/scaler lists with equal length.")
+    n_features = x_raw.shape[-1]
+    accum: Dict[str, np.ndarray] | None = None
+    for model_i, scaler_i in zip(models, scalers):
+        x_scaled = scaler_i.transform(x_raw.reshape(-1, n_features)).reshape(
+            len(x_raw), x_raw.shape[1], n_features
+        ).astype(np.float32)
+        pred_i = predict_outputs_dict(model_i, x_scaled)
+        if accum is None:
+            accum = {k: np.asarray(v, dtype=np.float64) for k, v in pred_i.items()}
+        else:
+            for k in accum.keys():
+                accum[k] += np.asarray(pred_i[k], dtype=np.float64)
+    assert accum is not None
+    inv_n = 1.0 / float(len(models))
+    return {k: (v * inv_n).astype(np.float32) for k, v in accum.items()}
 
 
 def scale_fold_data(
@@ -1355,6 +1407,7 @@ def run_single_fit(
             shuffle=True,
             cache=cache_dataset,
             sample_weights=train_sample_weights,
+            drop_remainder=False,
         )
         val_ds = make_dataset(
             X_val,
@@ -1363,6 +1416,7 @@ def run_single_fit(
             shuffle=False,
             cache=cache_dataset,
             sample_weights=val_sample_weights,
+            drop_remainder=False,
         )
         try:
             history = model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks, verbose=verbose)
@@ -3404,6 +3458,9 @@ def run_backtest(
     local_random_candidates: int,
     backtest_parallel_workers: int,
     backtest_progress_every: int,
+    backtest_adaptive_early_stop: bool,
+    backtest_early_stop_min_evals: int,
+    backtest_early_stop_patience: int,
     optimize_avg: bool,
     backtest_restarts: int = 1,
     restart_ensemble_topk: int = 1,
@@ -3423,6 +3480,8 @@ def run_backtest(
     no_retrain: bool = False,
     inference_model: keras.Model | None = None,
     inference_scaler: StandardScaler | None = None,
+    inference_models: List[keras.Model] | None = None,
+    inference_scalers: List[StandardScaler] | None = None,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     n_samples = len(X_seq)
     records: List[Dict[str, object]] = []
@@ -3529,16 +3588,28 @@ def run_backtest(
         # Strict one-step walk-forward on most recent N draws only.
         test_seq = recent_seq_indices(n_samples, focus_last_n, min_train=max(120, config.seq_len * 4))
         payloads: List[Dict[str, object]] = []
-        if bool(no_retrain) and inference_model is not None and inference_scaler is not None and len(test_seq) > 0:
-            n_features = X_seq.shape[-1]
-            X_test = inference_scaler.transform(X_seq[test_seq].reshape(-1, n_features)).reshape(
-                len(test_seq), X_seq.shape[1], n_features
-            ).astype(np.float32)
-            preds = predict_outputs_dict(inference_model, X_test)
-            for pos, seq_i in enumerate(test_seq, start=1):
-                target_row = int(target_rows[seq_i])
-                pred_pack = {k: v[pos - 1 : pos] for k, v in preds.items()}
-                payloads.append(_build_payload(pos, target_row, pred_pack))
+        if bool(no_retrain) and len(test_seq) > 0:
+            if inference_models and inference_scalers and len(inference_models) == len(inference_scalers):
+                preds = predict_outputs_dict_ensemble(
+                    models=list(inference_models),
+                    scalers=list(inference_scalers),
+                    x_raw=X_seq[test_seq],
+                )
+            elif inference_model is not None and inference_scaler is not None:
+                n_features = X_seq.shape[-1]
+                X_test = inference_scaler.transform(X_seq[test_seq].reshape(-1, n_features)).reshape(
+                    len(test_seq), X_seq.shape[1], n_features
+                ).astype(np.float32)
+                preds = predict_outputs_dict(inference_model, X_test)
+            else:
+                preds = {}
+            if not preds:
+                test_seq = np.asarray([], dtype=np.int32)
+            else:
+                for pos, seq_i in enumerate(test_seq, start=1):
+                    target_row = int(target_rows[seq_i])
+                    pred_pack = {k: v[pos - 1 : pos] for k, v in preds.items()}
+                    payloads.append(_build_payload(pos, target_row, pred_pack))
         else:
             for pos, seq_i in enumerate(test_seq, start=1):
                 train_idx, val_idx = one_step_train_val_indices(int(seq_i), min_train_core=max(120, config.seq_len * 4))
@@ -3685,11 +3756,11 @@ def run_backtest(
                 m = hit_metrics_from_arrays(hits_arr, addl_arr, sample_weights=sw)
                 if bool(optimize_avg):
                     score = (
-                        210.0 * float(m["avg_win_hits"])
-                        + 150.0 * float(m["p_hit_ge2"])
-                        + 95.0 * float(m["p_hit_ge3"])
-                        + 52.0 * float(m["p_hit_ge4"])
-                        + 6.0 * float(m["addl_acc"])
+                        240.0 * float(m["avg_win_hits"])
+                        + 120.0 * float(m["p_hit_ge2"])
+                        + 170.0 * float(m["p_hit_ge3"])
+                        + 260.0 * float(m["p_hit_ge4"])
+                        + 10.0 * float(m["addl_acc"])
                     )
                     if use_tail_bonus:
                         tail_n = int(min(max(0, latest_priority_n), len(hits_arr)))
@@ -3699,13 +3770,19 @@ def run_backtest(
                             tail_m = empty_hit_metrics()
                         # Strongly favor the latest N draws (especially latest 5 by default).
                         tail_score = (
-                            300.0 * float(tail_m["avg_win_hits"])
-                            + 140.0 * float(tail_m["p_hit_ge2"])
-                            + 120.0 * float(tail_m["p_hit_ge3"])
-                            + 84.0 * float(tail_m["p_hit_ge4"])
+                            880.0 * float(tail_m["avg_win_hits"])
+                            + 180.0 * float(tail_m["p_hit_ge2"])
+                            + 360.0 * float(tail_m["p_hit_ge3"])
+                            + 540.0 * float(tail_m["p_hit_ge4"])
                         )
                         score += float(latest_priority_lambda) * tail_score
-                        score += float(latest_priority_addl_lambda) * (120.0 * float(tail_m["addl_acc"]))
+                        score += float(latest_priority_addl_lambda) * (220.0 * float(tail_m["addl_acc"]))
+                        # Hard target bonus toward user KPI: last-N avg hits >= 4.
+                        tail_avg = float(tail_m["avg_win_hits"])
+                        if tail_avg >= 4.0:
+                            score += 3200.0 + 1400.0 * min(1.0, tail_avg - 4.0)
+                        if float(tail_m["p_hit_ge4"]) >= 0.4:
+                            score += 900.0
                 else:
                     score = blend_objective(
                         {
@@ -3728,9 +3805,14 @@ def run_backtest(
             ) -> List[Tuple[float, Dict[str, float]]]:
                 scored: List[Tuple[float, Dict[str, float]]] = []
                 total = len(candidates)
+                adaptive_enabled = bool(backtest_adaptive_early_stop) and stage_label == "full"
+                early_min = int(max(32, backtest_early_stop_min_evals))
+                early_patience = int(max(32, backtest_early_stop_patience))
+                best_seen = -1e18
+                no_improve = 0
                 if workers <= 1 or total <= 12:
                     for idx, cand in enumerate(candidates, start=1):
-                        scored.append(
+                        out_one = (
                             _score_blend_candidate(
                                 cand=cand,
                                 eval_payloads=eval_payloads,
@@ -3738,8 +3820,20 @@ def run_backtest(
                                 use_tail_bonus=use_tail_bonus,
                             )
                         )
+                        scored.append(out_one)
+                        if out_one[0] > best_seen + 1e-10:
+                            best_seen = float(out_one[0])
+                            no_improve = 0
+                        else:
+                            no_improve += 1
                         if idx % heartbeat_every == 0 or idx == total:
                             print(f"[BACKTEST-BLEND:{stage_label}] progress {idx}/{total}")
+                        if adaptive_enabled and idx >= early_min and no_improve >= early_patience:
+                            print(
+                                f"[BACKTEST-BLEND:{stage_label}] early-stop at {idx}/{total} "
+                                f"(best={best_seen:.6f}, patience={early_patience})"
+                            )
+                            break
                     return scored
 
                 chunk_size = int(max(8, math.ceil(total / max(1, workers * 6))))
@@ -3760,21 +3854,56 @@ def run_backtest(
                         )
                     return out_chunk
 
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
-                    for fut in as_completed(futures):
-                        chunk_len = int(futures[fut])
-                        completed += chunk_len
-                        try:
-                            scored.extend(fut.result())
-                        except Exception as exc:
+                if not adaptive_enabled:
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
+                        for fut in as_completed(futures):
+                            chunk_len = int(futures[fut])
+                            completed += chunk_len
+                            try:
+                                scored.extend(fut.result())
+                            except Exception as exc:
+                                if (completed - last_report) >= heartbeat_every or completed >= total:
+                                    print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}, last_error={exc}")
+                                    last_report = completed
+                                continue
                             if (completed - last_report) >= heartbeat_every or completed >= total:
-                                print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}, last_error={exc}")
+                                print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}")
                                 last_report = completed
-                            continue
-                        if (completed - last_report) >= heartbeat_every or completed >= total:
-                            print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}")
-                            last_report = completed
+                    return scored
+
+                # Adaptive wave-scoring with early-stop on score plateau.
+                wave = int(max(1, workers))
+                for i in range(0, len(chunks), wave):
+                    batch_chunks = chunks[i : i + wave]
+                    with ThreadPoolExecutor(max_workers=min(workers, len(batch_chunks))) as ex:
+                        futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in batch_chunks}
+                        for fut in as_completed(futures):
+                            chunk_len = int(futures[fut])
+                            completed += chunk_len
+                            try:
+                                out_chunk = fut.result()
+                                scored.extend(out_chunk)
+                                for s, _ in out_chunk:
+                                    if s > best_seen + 1e-10:
+                                        best_seen = float(s)
+                                        no_improve = 0
+                                    else:
+                                        no_improve += 1
+                            except Exception as exc:
+                                if (completed - last_report) >= heartbeat_every or completed >= total:
+                                    print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}, last_error={exc}")
+                                    last_report = completed
+                                continue
+                            if (completed - last_report) >= heartbeat_every or completed >= total:
+                                print(f"[BACKTEST-BLEND:{stage_label}] progress {completed}/{total}")
+                                last_report = completed
+                    if completed >= early_min and no_improve >= early_patience:
+                        print(
+                            f"[BACKTEST-BLEND:{stage_label}] early-stop at {completed}/{total} "
+                            f"(best={best_seen:.6f}, patience={early_patience})"
+                        )
+                        break
                 return scored
 
             eval_candidates = cand_pool
@@ -4345,8 +4474,25 @@ def build_single_html_report(
       x: D.scoremap.x,
       y: D.scoremap.y,
       type:'heatmap',
-      colorscale:'Viridis'
-    }}], {{...baseLayout, title:'Recency-Weighted Number Score Heatmap', xaxis:{{title:'Number (1..49)'}}, yaxis:{{title:'Component'}}}}, {{responsive:true}});
+      colorscale:'Viridis',
+      colorbar:{{thickness:16, len:0.86, tickformat:'.3f'}}
+    }}], {{
+      ...baseLayout,
+      title:'Recency-Weighted Number Score Heatmap',
+      height: 420,
+      margin: {{l: 120, r: 24, t: 56, b: 56}},
+      xaxis: {{
+        title:'Number (1..49)',
+        tickmode:'array',
+        tickvals:[1,5,10,15,20,25,30,35,40,45,49],
+        automargin:true
+      }},
+      yaxis: {{
+        title:'Component',
+        automargin:true,
+        tickfont:{{size: 13}}
+      }}
+    }}, {{responsive:true}});
 
   </script>
 </body>
@@ -4472,35 +4618,34 @@ def main() -> None:
     if bool(args.avg_hit_focused):
         prev_backtest_opt = bool(args.backtest_optimize_avg)
         args.backtest_optimize_avg = True
-        # Anchor avg-focus defaults to the stronger region observed in
-        # g12_prod_sweep_20260317_134345 (top runs by avg_win_hits).
-        args.w_graph = _profile_or_clip(args.w_graph, default=1.6, profile=1.90, lo=1.60)
-        args.w_cluster = _profile_or_clip(args.w_cluster, default=1.35, profile=1.00, lo=0.70, hi=1.35)
-        args.reward_a = _profile_or_clip(args.reward_a, default=1.0, profile=1.90, lo=1.70, hi=2.20)
-        args.reward_b = _profile_or_clip(args.reward_b, default=2.4, profile=2.70, lo=1.90, hi=2.80)
-        args.reward_c = _profile_or_clip(args.reward_c, default=6.8, profile=4.60, lo=3.60, hi=5.80)
+        # Anchor avg-focus defaults to the selected G12_C sweep profile.
+        args.w_graph = _profile_or_clip(args.w_graph, default=1.70, profile=1.70, lo=1.40)
+        args.w_cluster = _profile_or_clip(args.w_cluster, default=1.30, profile=1.30, lo=0.80, hi=1.35)
+        args.reward_a = _profile_or_clip(args.reward_a, default=2.20, profile=2.20, lo=1.70, hi=2.40)
+        args.reward_b = _profile_or_clip(args.reward_b, default=3.20, profile=3.20, lo=2.20, hi=3.40)
+        args.reward_c = _profile_or_clip(args.reward_c, default=8.60, profile=8.60, lo=5.00, hi=9.00)
         args.reward_scale = _profile_or_clip(args.reward_scale, default=0.55, profile=0.55, lo=0.45, hi=0.70)
-        args.anti_repeat_window = _profile_or_floor_int(args.anti_repeat_window, default_max=10, profile=12, floor=10)
-        args.anti_repeat_lambda = _profile_or_clip(args.anti_repeat_lambda, default=1.25, profile=0.90, lo=0.45, hi=1.10)
+        args.anti_repeat_window = _profile_or_floor_int(args.anti_repeat_window, default_max=10, profile=10, floor=8)
+        args.anti_repeat_lambda = _profile_or_clip(args.anti_repeat_lambda, default=1.75, profile=1.75, lo=0.80, hi=2.20)
         args.candidate_diversity_lambda = _profile_or_clip(
-            args.candidate_diversity_lambda, default=0.11, profile=0.10, lo=0.05, hi=0.16
+            args.candidate_diversity_lambda, default=0.07, profile=0.07, lo=0.03, hi=0.14
         )
-        args.candidate_max_pool = _profile_or_floor_int(args.candidate_max_pool, default_max=48, profile=72, floor=48)
-        args.candidate_gumbel_samples = _profile_or_floor_int(args.candidate_gumbel_samples, default_max=28, profile=52, floor=28)
+        args.candidate_max_pool = _profile_or_floor_int(args.candidate_max_pool, default_max=104, profile=104, floor=48)
+        args.candidate_gumbel_samples = _profile_or_floor_int(args.candidate_gumbel_samples, default_max=88, profile=88, floor=28)
         args.expected_hit_rerank = True
-        args.expected_hit_lambda = _profile_or_clip(args.expected_hit_lambda, default=2.20, profile=2.65, lo=2.20, hi=3.10)
+        args.expected_hit_lambda = _profile_or_clip(args.expected_hit_lambda, default=3.40, profile=3.40, lo=2.40, hi=3.80)
         args.expected_hit_synergy_lambda = _profile_or_clip(
-            args.expected_hit_synergy_lambda, default=0.48, profile=0.55, lo=0.40, hi=0.85
+            args.expected_hit_synergy_lambda, default=0.82, profile=0.82, lo=0.45, hi=1.10
         )
         args.latest_priority_n = _profile_or_floor_int(args.latest_priority_n, default_max=5, profile=5, floor=3)
         args.latest_priority_boost = _profile_or_clip(
-            args.latest_priority_boost, default=3.4, profile=3.8, lo=2.6, hi=5.2
+            args.latest_priority_boost, default=5.0, profile=5.0, lo=3.0, hi=6.0
         )
         args.latest_priority_lambda = _profile_or_clip(
-            args.latest_priority_lambda, default=2.2, profile=2.4, lo=1.4, hi=4.2
+            args.latest_priority_lambda, default=2.9, profile=2.9, lo=1.6, hi=4.5
         )
         args.latest_priority_addl_lambda = _profile_or_clip(
-            args.latest_priority_addl_lambda, default=1.6, profile=1.4, lo=0.9, hi=2.6
+            args.latest_priority_addl_lambda, default=2.0, profile=2.0, lo=1.0, hi=2.8
         )
         print(
             "[AVG-FOCUS] enabled: "
@@ -4709,6 +4854,7 @@ def main() -> None:
     best_weights: List[np.ndarray] | None = None
     best_scaler_x: StandardScaler | None = None
     best_history_dict: Dict[str, List[float]] = {}
+    restart_snapshots: List[Dict[str, object]] = []
 
     for restart_i in range(n_restarts):
         restart_seed = int(args.seed) + 97 * restart_i
@@ -4759,6 +4905,17 @@ def main() -> None:
             f"p>=4={restart_metrics['p_hit_ge4']:.4f} avg={restart_metrics['avg_win_hits']:.4f} "
             f"val_loss={restart_val_loss:.4f}"
         )
+        restart_snapshots.append(
+            {
+                "score": float(restart_score),
+                "val_loss": float(restart_val_loss),
+                "seed": int(restart_seed),
+                "weights": model_i.get_weights(),
+                "scaler": scaler_i,
+                "metrics": dict(restart_metrics),
+                "history": {k: [float(x) for x in v] for k, v in history_i.history.items()},
+            }
+        )
         if (restart_score > best_restart_score + 1e-10) or (
             abs(restart_score - best_restart_score) <= 1e-10 and restart_val_loss < best_restart_val_loss
         ):
@@ -4773,15 +4930,26 @@ def main() -> None:
     if best_weights is None or best_scaler_x is None:
         raise RuntimeError("Final training restarts failed to produce a model.")
 
+    if not restart_snapshots:
+        raise RuntimeError("No restart snapshot collected for final inference.")
+    restart_snapshots.sort(key=lambda r: (float(r["score"]), -float(r["val_loss"])), reverse=True)
+    ensemble_k = int(max(1, min(int(args.restart_ensemble_topk), len(restart_snapshots))))
+
     tf.keras.backend.clear_session()
-    model = build_model(
-        best_config,
-        n_features=X_seq.shape[-1],
-        n_aux=y_raw["aux"].shape[-1],
-        steps_per_execution=int(args.steps_per_execution),
-    )
-    model.set_weights(best_weights)
-    scaler_x = best_scaler_x
+    inference_models: List[keras.Model] = []
+    inference_scalers: List[StandardScaler] = []
+    for snap in restart_snapshots[:ensemble_k]:
+        m_i = build_model(
+            best_config,
+            n_features=X_seq.shape[-1],
+            n_aux=y_raw["aux"].shape[-1],
+            steps_per_execution=int(args.steps_per_execution),
+        )
+        m_i.set_weights(snap["weights"])  # type: ignore[arg-type]
+        inference_models.append(m_i)
+        inference_scalers.append(snap["scaler"])  # type: ignore[arg-type]
+    model = inference_models[0]
+    scaler_x = inference_scalers[0]
     final_history = keras.callbacks.History()
     final_history.history = best_history_dict
     print(
@@ -4789,6 +4957,7 @@ def main() -> None:
         f"restarts={n_restarts} selected_seed={best_restart_seed} "
         f"restart_score={best_restart_score:.4f} "
         f"p>=3={best_restart_metrics['p_hit_ge3']:.4f} p>=4={best_restart_metrics['p_hit_ge4']:.4f} "
+        f"ensemble_topk={ensemble_k} "
         f"epochs={len(final_history.history.get('loss', []))} "
         f"best_val_loss={best_restart_val_loss:.4f}"
     )
@@ -4841,19 +5010,64 @@ def main() -> None:
     else:
         blend_eval_idx = val_idx
         blend_eval_weights = None
-    blend_eval_preds: Dict[str, np.ndarray] | None = None
-    if len(blend_eval_idx) > 0:
-        n_features = X_seq.shape[-1]
-        X_blend_eval = scaler_x.transform(X_seq[blend_eval_idx].reshape(-1, n_features)).reshape(
-            len(blend_eval_idx), X_seq.shape[1], n_features
-        ).astype(np.float32)
-        blend_eval_preds = predict_outputs_dict(model, X_blend_eval)
+
+    # Nested blend split: optimize on head, then pick by most recent holdout tail.
+    blend_opt_idx = np.asarray(blend_eval_idx, dtype=np.int32)
+    blend_holdout_idx = np.asarray([], dtype=np.int32)
+    blend_opt_weights = None if blend_eval_weights is None else np.asarray(blend_eval_weights, dtype=np.float32)
+    blend_holdout_weights = None
+    if (
+        bool(args.blend_nested_holdout)
+        and args.focus_last_n > 0
+        and len(blend_eval_idx) >= 12
+    ):
+        holdout_n = int(max(4, min(int(args.blend_holdout_size), len(blend_eval_idx) // 2)))
+        head_n = int(len(blend_eval_idx) - holdout_n)
+        if head_n >= 8:
+            blend_opt_idx = np.asarray(blend_eval_idx[:head_n], dtype=np.int32)
+            blend_holdout_idx = np.asarray(blend_eval_idx[head_n:], dtype=np.int32)
+            if blend_eval_weights is not None:
+                blend_opt_weights = np.asarray(blend_eval_weights[:head_n], dtype=np.float32)
+                blend_holdout_weights = np.asarray(blend_eval_weights[head_n:], dtype=np.float32)
+            print(
+                "[BLEND-HOLDOUT] nested split enabled: "
+                f"opt={len(blend_opt_idx)} holdout={len(blend_holdout_idx)}"
+            )
+
+    blend_opt_preds: Dict[str, np.ndarray] | None = None
+    blend_holdout_preds: Dict[str, np.ndarray] | None = None
+    if len(blend_opt_idx) > 0:
+        if len(inference_models) > 1 and len(inference_models) == len(inference_scalers):
+            blend_opt_preds = predict_outputs_dict_ensemble(
+                models=inference_models,
+                scalers=inference_scalers,
+                x_raw=X_seq[blend_opt_idx],
+            )
+        else:
+            n_features = X_seq.shape[-1]
+            X_blend_opt = scaler_x.transform(X_seq[blend_opt_idx].reshape(-1, n_features)).reshape(
+                len(blend_opt_idx), X_seq.shape[1], n_features
+            ).astype(np.float32)
+            blend_opt_preds = predict_outputs_dict(model, X_blend_opt)
+    if len(blend_holdout_idx) > 0:
+        if len(inference_models) > 1 and len(inference_models) == len(inference_scalers):
+            blend_holdout_preds = predict_outputs_dict_ensemble(
+                models=inference_models,
+                scalers=inference_scalers,
+                x_raw=X_seq[blend_holdout_idx],
+            )
+        else:
+            n_features = X_seq.shape[-1]
+            X_blend_hold = scaler_x.transform(X_seq[blend_holdout_idx].reshape(-1, n_features)).reshape(
+                len(blend_holdout_idx), X_seq.shape[1], n_features
+            ).astype(np.float32)
+            blend_holdout_preds = predict_outputs_dict(model, X_blend_hold)
 
     calibrated_blend, blend_component_df = calibrate_blend_weights_by_component_performance(
         model=model,
         scaler_x=scaler_x,
         X_seq=X_seq,
-        eval_idx=blend_eval_idx,
+        eval_idx=blend_opt_idx,
         target_rows=target_rows,
         df=df,
         win_cluster_prior_matrix=win_cluster_prior_matrix,
@@ -4862,8 +5076,8 @@ def main() -> None:
         addl_cluster_prior_matrix=addl_cluster_prior_matrix,
         repel_prior_matrix=repel_prior_matrix,
         base_weights=BLEND_WEIGHTS,
-        sample_weights=blend_eval_weights,
-        cached_preds=blend_eval_preds,
+        sample_weights=blend_opt_weights,
+        cached_preds=blend_opt_preds,
         dynamic_blend=bool(args.uncertainty_dynamic_blend),
         candidate_max_pool=int(args.candidate_max_pool),
         candidate_gumbel_samples=int(args.candidate_gumbel_samples),
@@ -4892,7 +5106,7 @@ def main() -> None:
     )
     blend_workers = auto_parallel_workers(int(args.backtest_parallel_workers), cap=0)
     blend_heartbeat_every = int(max(8, int(args.backtest_progress_every)))
-    blend_focused = objective_hit_focused
+    blend_focused = bool(objective_hit_focused or args.avg_hit_focused)
     best_blend_score = -1e9
 
     def _blend_eval_once(
@@ -4904,7 +5118,7 @@ def main() -> None:
             model=model,
             scaler_x=scaler_x,
             X_seq=X_seq,
-            eval_idx=blend_eval_idx,
+            eval_idx=blend_opt_idx,
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
@@ -4913,8 +5127,8 @@ def main() -> None:
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=cand,
-            sample_weights=blend_eval_weights,
-            cached_preds=blend_eval_preds,
+            sample_weights=blend_opt_weights,
+            cached_preds=blend_opt_preds,
             dynamic_blend=bool(args.uncertainty_dynamic_blend),
             candidate_max_pool=int(candidate_max_pool),
             candidate_gumbel_samples=int(candidate_gumbel_samples),
@@ -4936,11 +5150,28 @@ def main() -> None:
     ) -> List[Tuple[float, Dict[str, float], Dict[str, float]]]:
         scored: List[Tuple[float, Dict[str, float], Dict[str, float]]] = []
         total = len(candidates)
+        adaptive_enabled = bool(args.blend_adaptive_early_stop) and stage == "full"
+        early_min = int(max(32, int(args.blend_early_stop_min_evals)))
+        early_patience = int(max(32, int(args.blend_early_stop_patience)))
+        best_seen = -1e18
+        no_improve = 0
         if blend_workers <= 1 or total <= 12:
             for idx, cand in enumerate(candidates, start=1):
-                scored.append(_blend_eval_once(cand, candidate_max_pool, candidate_gumbel_samples))
+                out_one = _blend_eval_once(cand, candidate_max_pool, candidate_gumbel_samples)
+                scored.append(out_one)
+                if out_one[0] > best_seen + 1e-10:
+                    best_seen = float(out_one[0])
+                    no_improve = 0
+                else:
+                    no_improve += 1
                 if idx % blend_heartbeat_every == 0 or idx == total:
                     print(f"[BLEND-SEARCH:{stage}] progress {idx}/{total}")
+                if adaptive_enabled and idx >= early_min and no_improve >= early_patience:
+                    print(
+                        f"[BLEND-SEARCH:{stage}] early-stop at {idx}/{total} "
+                        f"(best={best_seen:.6f}, patience={early_patience})"
+                    )
+                    break
             return scored
 
         chunk_size = int(max(8, math.ceil(total / max(1, blend_workers * 6))))
@@ -4954,21 +5185,55 @@ def main() -> None:
                 out_chunk.append(_blend_eval_once(cand, candidate_max_pool, candidate_gumbel_samples))
             return out_chunk
 
-        with ThreadPoolExecutor(max_workers=blend_workers) as ex:
-            futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
-            for fut in as_completed(futures):
-                chunk_len = int(futures[fut])
-                completed += chunk_len
-                try:
-                    scored.extend(fut.result())
-                except Exception as exc:
+        if not adaptive_enabled:
+            with ThreadPoolExecutor(max_workers=blend_workers) as ex:
+                futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in chunks}
+                for fut in as_completed(futures):
+                    chunk_len = int(futures[fut])
+                    completed += chunk_len
+                    try:
+                        scored.extend(fut.result())
+                    except Exception as exc:
+                        if (completed - last_report) >= blend_heartbeat_every or completed >= total:
+                            print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}, last_error={exc}")
+                            last_report = completed
+                        continue
                     if (completed - last_report) >= blend_heartbeat_every or completed >= total:
-                        print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}, last_error={exc}")
+                        print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}")
                         last_report = completed
-                    continue
-                if (completed - last_report) >= blend_heartbeat_every or completed >= total:
-                    print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}")
-                    last_report = completed
+            return scored
+
+        wave = int(max(1, blend_workers))
+        for i in range(0, len(chunks), wave):
+            batch_chunks = chunks[i : i + wave]
+            with ThreadPoolExecutor(max_workers=min(blend_workers, len(batch_chunks))) as ex:
+                futures = {ex.submit(_score_chunk, chunk): len(chunk) for chunk in batch_chunks}
+                for fut in as_completed(futures):
+                    chunk_len = int(futures[fut])
+                    completed += chunk_len
+                    try:
+                        out_chunk = fut.result()
+                        scored.extend(out_chunk)
+                        for s, _, _ in out_chunk:
+                            if s > best_seen + 1e-10:
+                                best_seen = float(s)
+                                no_improve = 0
+                            else:
+                                no_improve += 1
+                    except Exception as exc:
+                        if (completed - last_report) >= blend_heartbeat_every or completed >= total:
+                            print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}, last_error={exc}")
+                            last_report = completed
+                        continue
+                    if (completed - last_report) >= blend_heartbeat_every or completed >= total:
+                        print(f"[BLEND-SEARCH:{stage}] progress {completed}/{total}")
+                        last_report = completed
+            if completed >= early_min and no_improve >= early_patience:
+                print(
+                    f"[BLEND-SEARCH:{stage}] early-stop at {completed}/{total} "
+                    f"(best={best_seen:.6f}, patience={early_patience})"
+                )
+                break
         return scored
 
     eval_candidates = blend_candidates
@@ -5013,7 +5278,7 @@ def main() -> None:
             model=model,
             scaler_x=scaler_x,
             X_seq=X_seq,
-            eval_idx=blend_eval_idx,
+            eval_idx=blend_opt_idx,
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
@@ -5022,8 +5287,8 @@ def main() -> None:
             addl_cluster_prior_matrix=addl_cluster_prior_matrix,
             repel_prior_matrix=repel_prior_matrix,
             weights=cand,
-            sample_weights=blend_eval_weights,
-            cached_preds=blend_eval_preds,
+            sample_weights=blend_opt_weights,
+            cached_preds=blend_opt_preds,
             dynamic_blend=bool(args.uncertainty_dynamic_blend),
             candidate_max_pool=int(args.candidate_max_pool),
             candidate_gumbel_samples=int(args.candidate_gumbel_samples),
@@ -5037,6 +5302,60 @@ def main() -> None:
         eval_cache[key] = metrics
         setattr(eval_blend_metrics, "_cache", eval_cache)
         return metrics
+
+    def eval_blend_metrics_holdout(cand: Dict[str, float]) -> Dict[str, float]:
+        if len(blend_holdout_idx) == 0:
+            return eval_blend_metrics(cand)
+        eval_cache: Dict[Tuple[float, ...], Dict[str, float]] = getattr(eval_blend_metrics_holdout, "_cache", {})
+        key = blend_weight_key(
+            normalize_blend_groups(dict(cand), win_total=blend_win_total, addl_total=blend_addl_total),
+            decimals=8,
+        )
+        if key in eval_cache:
+            return eval_cache[key]
+        metrics = evaluate_hit_score(
+            model=model,
+            scaler_x=scaler_x,
+            X_seq=X_seq,
+            eval_idx=blend_holdout_idx,
+            target_rows=target_rows,
+            df=df,
+            win_cluster_prior_matrix=win_cluster_prior_matrix,
+            graph_prior_matrix=graph_prior_matrix,
+            embed_prior_matrix=embed_prior_matrix,
+            addl_cluster_prior_matrix=addl_cluster_prior_matrix,
+            repel_prior_matrix=repel_prior_matrix,
+            weights=cand,
+            sample_weights=blend_holdout_weights,
+            cached_preds=blend_holdout_preds,
+            dynamic_blend=bool(args.uncertainty_dynamic_blend),
+            candidate_max_pool=int(args.candidate_max_pool),
+            candidate_gumbel_samples=int(args.candidate_gumbel_samples),
+            candidate_diversity_lambda=float(args.candidate_diversity_lambda),
+            expected_hit_rerank=bool(args.expected_hit_rerank),
+            expected_hit_lambda=float(args.expected_hit_lambda),
+            expected_hit_synergy_lambda=float(args.expected_hit_synergy_lambda),
+            anti_repeat_window=int(args.anti_repeat_window),
+            anti_repeat_lambda=float(args.anti_repeat_lambda),
+        )
+        eval_cache[key] = metrics
+        setattr(eval_blend_metrics_holdout, "_cache", eval_cache)
+        return metrics
+
+    def holdout_objective(metrics: Dict[str, float]) -> float:
+        tail_bonus = 0.0
+        if float(metrics.get("avg_win_hits", 0.0)) >= 4.0:
+            tail_bonus += 3200.0
+        if float(metrics.get("p_hit_ge4", 0.0)) >= 0.40:
+            tail_bonus += 900.0
+        return (
+            880.0 * float(metrics.get("avg_win_hits", 0.0))
+            + 360.0 * float(metrics.get("p_hit_ge3", 0.0))
+            + 540.0 * float(metrics.get("p_hit_ge4", 0.0))
+            + 180.0 * float(metrics.get("p_hit_ge2", 0.0))
+            + 40.0 * float(metrics.get("addl_acc", 0.0))
+            + tail_bonus
+        )
 
     selected_blend, selected_blend_metrics, best_blend_score = coordinate_ascent_blend_search(
         start_weights=selected_blend,
@@ -5060,6 +5379,36 @@ def main() -> None:
             candidates_per_iter=int(args.blend_tail_candidates),
         )
 
+    # Nested holdout candidate selection to reduce recent-window overfit.
+    if len(blend_holdout_idx) > 0:
+        holdout_pool: List[Dict[str, float]] = [dict(selected_blend), dict(calibrated_blend)]
+        for _, _, cand in scored_candidates[: max(12, min(64, len(scored_candidates)))]:
+            holdout_pool.append(dict(cand))
+        holdout_pool = dedupe_blend_candidates(
+            holdout_pool,
+            win_total=blend_win_total,
+            addl_total=blend_addl_total,
+        )
+        best_holdout_obj = -1e18
+        best_holdout_weights = dict(selected_blend)
+        best_holdout_metrics = dict(selected_blend_metrics)
+        for cand in holdout_pool:
+            m = eval_blend_metrics_holdout(cand)
+            s = holdout_objective(m)
+            if s > best_holdout_obj + 1e-10:
+                best_holdout_obj = float(s)
+                best_holdout_weights = dict(cand)
+                best_holdout_metrics = dict(m)
+        selected_blend = best_holdout_weights
+        selected_blend_metrics = eval_blend_metrics(selected_blend)
+        best_blend_score = float(blend_objective(selected_blend_metrics, focused=blend_focused))
+        print(
+            "[BLEND-HOLDOUT] selected by holdout: "
+            f"holdout_obj={best_holdout_obj:.6f}, holdout_avg={best_holdout_metrics.get('avg_win_hits', 0.0):.4f}, "
+            f"holdout_p3={best_holdout_metrics.get('p_hit_ge3', 0.0):.4f}, "
+            f"holdout_p4={best_holdout_metrics.get('p_hit_ge4', 0.0):.4f}"
+        )
+
     blend_scope = f"last {args.focus_last_n}" if args.focus_last_n > 0 else "validation"
     print(f"Selected blend ({blend_scope}-optimized): {selected_blend}")
     print(f"Selected blend metrics on {blend_scope}: {selected_blend_metrics}")
@@ -5071,7 +5420,7 @@ def main() -> None:
             model=model,
             scaler_x=scaler_x,
             X_seq=X_seq,
-            eval_idx=np.asarray(blend_eval_idx, dtype=np.int32),
+            eval_idx=np.asarray(blend_opt_idx, dtype=np.int32),
             target_rows=target_rows,
             df=df,
             win_cluster_prior_matrix=win_cluster_prior_matrix,
@@ -5135,6 +5484,9 @@ def main() -> None:
         local_random_candidates=int(args.backtest_local_random_candidates),
         backtest_parallel_workers=int(args.backtest_parallel_workers),
         backtest_progress_every=int(args.backtest_progress_every),
+        backtest_adaptive_early_stop=bool(args.backtest_adaptive_early_stop),
+        backtest_early_stop_min_evals=int(args.backtest_early_stop_min_evals),
+        backtest_early_stop_patience=int(args.backtest_early_stop_patience),
         optimize_avg=bool(args.backtest_optimize_avg),
         backtest_restarts=int(args.backtest_restarts),
         restart_ensemble_topk=int(args.restart_ensemble_topk),
@@ -5154,6 +5506,8 @@ def main() -> None:
         no_retrain=bool(args.backtest_no_retrain),
         inference_model=model,
         inference_scaler=scaler_x,
+        inference_models=inference_models,
+        inference_scalers=inference_scalers,
     )
     _mark_stage("backtest")
 
@@ -5178,8 +5532,15 @@ def main() -> None:
     repel_next_prior = build_repel_system(next_df)["repel_prior"][-1]
     embed_next_prior = normalize_prob(embed_prior_matrix[-1])
 
-    latest_seq = scaler_x.transform(X_seq[-1].reshape(-1, n_features)).reshape(1, X_seq.shape[1], n_features).astype(np.float32)
-    pred_latest = predict_outputs_dict(model, latest_seq)
+    if len(inference_models) > 1 and len(inference_models) == len(inference_scalers):
+        pred_latest = predict_outputs_dict_ensemble(
+            models=inference_models,
+            scalers=inference_scalers,
+            x_raw=X_seq[-1:],
+        )
+    else:
+        latest_seq = scaler_x.transform(X_seq[-1].reshape(-1, n_features)).reshape(1, X_seq.shape[1], n_features).astype(np.float32)
+        pred_latest = predict_outputs_dict(model, latest_seq)
     recent_final_pred_sets: List[Tuple[int, ...]] = []
     recent_final_pred_addl_sets: List[Tuple[int, ...]] = []
     if not backtest_df.empty:
@@ -5307,7 +5668,7 @@ def main() -> None:
                 recency_counts[int(n) - 1] += w
     recency_prob = normalize_prob(recency_counts)
     scoremap_x = list(range(1, 50))
-    scoremap_y = ["combined", "model_soft", "graph", "embed", "cluster", "recency"]
+    scoremap_y = ["Combined", "Model Soft", "Graph", "Embed", "Cluster", "Recency"]
     scoremap_z = [
         combined_win_dbg.astype(float).tolist(),
         model_soft_dbg.astype(float).tolist(),

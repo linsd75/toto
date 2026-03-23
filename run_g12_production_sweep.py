@@ -181,13 +181,18 @@ def score_row(row: Dict[str, float]) -> float:
     def z(v: float, default: float = -1e9) -> float:
         return default if v != v else float(v)
 
+    last5_avg = z(row["last5_avg_hits"])
+    tail_bonus = 0.0
+    if last5_avg >= 4.0:
+        tail_bonus += 4200.0 + 1200.0 * min(1.0, last5_avg - 4.0)
     return (
-        210.0 * z(row["avg_win_hits"])
-        + 120.0 * z(row["p_hit_ge_3_pct"])
-        + 105.0 * z(row["p_hit_ge_4_pct"])
-        + 90.0 * z(row["last5_avg_hits"])
-        + 45.0 * z(row["last5_ge3_rate"])
-        + 14.0 * z(row["last5_addl_acc"])
+        420.0 * z(row["avg_win_hits"])
+        + 180.0 * z(row["p_hit_ge_3_pct"])
+        + 240.0 * z(row["p_hit_ge_4_pct"])
+        + 960.0 * last5_avg
+        + 420.0 * z(row["last5_ge3_rate"])
+        + 80.0 * z(row["last5_addl_acc"])
+        + tail_bonus
     )
 
 
@@ -253,10 +258,27 @@ def build_cmd(
         "--backtest-epochs",
         str(cfg.backtest_epochs),
         "--backtest-no-retrain",
+        "--backtest-restarts",
+        "2",
+        "--restart-ensemble-topk",
+        "2",
         "--backtest-parallel-workers",
         "0",
         "--backtest-progress-every",
         "25",
+        "--blend-nested-holdout",
+        "--blend-holdout-size",
+        "6",
+        "--blend-adaptive-early-stop",
+        "--blend-early-stop-min-evals",
+        "320",
+        "--blend-early-stop-patience",
+        "220",
+        "--backtest-adaptive-early-stop",
+        "--backtest-early-stop-min-evals",
+        "560",
+        "--backtest-early-stop-patience",
+        "360",
         "--blend-random-candidates",
         str(cfg.blend_random),
         "--blend-coordinate-iters",
@@ -299,7 +321,13 @@ def build_cmd(
 def main() -> None:
     ap = argparse.ArgumentParser(description="Production sweep for Predict_Toto_G12.py")
     ap.add_argument("--csv", default="ToTo-12_Mar_2026.csv", help="Input CSV path")
-    ap.add_argument("--runs", type=int, default=6, help="Max number of configs to run")
+    ap.add_argument("--runs", type=int, default=32, help="Max number of configs to run")
+    ap.add_argument(
+        "--final-upgrade",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Upgrade winner into a heavier final pass (can improve or degrade; default keeps exact winner config)",
+    )
     ap.add_argument(
         "--combined-log",
         default="models/g12_sweep_combined.log",
@@ -328,16 +356,84 @@ def main() -> None:
             fh.write(line + "\n")
             fh.flush()
 
-    configs: List[G12Config] = [
-        G12Config("G12_A", 42, 1.9, 2.8, 7.4, 1.35, 0.10, 2.7, 0.55, 1.45, 1.35, 1.55, 3.8, 2.2, 1.4, 6, 6, 24, 8, 1400, 10, 80, 80, 56),
-        G12Config("G12_B", 139, 2.0, 3.0, 8.0, 1.55, 0.08, 3.1, 0.70, 1.55, 1.45, 1.65, 4.4, 2.6, 1.7, 7, 6, 28, 10, 1800, 12, 110, 92, 72),
-        G12Config("G12_C", 236, 2.2, 3.2, 8.6, 1.75, 0.07, 3.4, 0.82, 1.70, 1.30, 1.80, 5.0, 2.9, 2.0, 8, 8, 32, 12, 2200, 14, 140, 104, 88),
-        G12Config("G12_D", 333, 1.8, 2.7, 7.2, 1.10, 0.11, 2.5, 0.50, 1.35, 1.55, 1.40, 3.5, 2.0, 1.2, 6, 6, 26, 8, 1300, 10, 72, 76, 52),
-        G12Config("G12_E", 430, 2.1, 3.1, 8.2, 1.65, 0.09, 3.2, 0.74, 1.62, 1.40, 1.72, 4.8, 2.8, 1.9, 8, 7, 30, 10, 2000, 14, 128, 96, 80),
-        G12Config("G12_F", 527, 1.7, 2.5, 6.8, 0.95, 0.12, 2.3, 0.42, 1.25, 1.65, 1.25, 3.2, 1.8, 1.0, 5, 5, 22, 8, 1000, 8, 64, 68, 40),
-        G12Config("G12_G", 624, 2.05, 3.05, 8.35, 1.48, 0.085, 3.25, 0.76, 1.68, 1.28, 1.78, 4.9, 2.75, 1.85, 8, 8, 30, 10, 2100, 14, 132, 98, 84),
-        G12Config("G12_H", 721, 1.95, 2.9, 7.8, 1.25, 0.095, 2.95, 0.64, 1.52, 1.48, 1.62, 4.2, 2.4, 1.55, 7, 7, 28, 10, 1700, 12, 104, 90, 68),
-    ]
+    # 32-run win-factor sweep from discovered ranges:
+    # C-mid family (16 runs):
+    # reward_a~1.85-1.98, reward_b~2.72-2.90, reward_c~7.40-8.05
+    # N-high family (16 runs):
+    # reward_a~2.06-2.18, reward_b~3.02-3.20, reward_c~8.40-8.90
+    # Shared stable ranges:
+    # w_cluster~=1.35, w_graph~1.40-1.54, anti_repeat~0.80-0.95, diversity~0.09-0.10,
+    # expected_lambda~2.6-3.2, synergy~0.50-0.70, latestBoost~3.65-4.60, latestL~2.10-2.70
+    def lerp(a: float, b: float, t: float) -> float:
+        return a + (b - a) * t
+
+    def iround(x: float) -> int:
+        return int(round(x))
+
+    configs: List[G12Config] = []
+    tvals = [i / 15.0 for i in range(16)]
+
+    for i, t in enumerate(tvals):
+        # C-mid (lower-moderate pressure)
+        configs.append(
+            G12Config(
+                f"C{i + 1:02d}",
+                721 + i * 17,
+                round(lerp(1.85, 1.98, t), 3),
+                round(lerp(2.72, 2.90, t), 3),
+                round(lerp(7.40, 8.05, t), 3),
+                round(lerp(0.95, 0.82, t), 3),
+                round(lerp(0.10, 0.09, t), 3),
+                round(lerp(2.60, 3.00, t), 3),
+                round(lerp(0.50, 0.62, t), 3),
+                round(lerp(1.40, 1.48, t), 3),
+                1.35,
+                round(lerp(1.34, 1.50, t), 3),
+                round(lerp(3.65, 4.30, t), 3),
+                round(lerp(2.10, 2.45, t), 3),
+                round(lerp(1.20, 1.55, t), 3),
+                iround(lerp(6, 7, t)),
+                iround(lerp(6, 7, t)),
+                iround(lerp(24, 28, t)),
+                iround(lerp(8, 10, t)),
+                iround(lerp(1300, 1750, t)),
+                iround(lerp(10, 12, t)),
+                iround(lerp(80, 108, t)),
+                iround(lerp(76, 94, t)),
+                iround(lerp(48, 66, t)),
+            )
+        )
+
+    for i, t in enumerate(tvals):
+        # N-high (higher pressure)
+        configs.append(
+            G12Config(
+                f"N{i + 1:02d}",
+                1801 + i * 17,
+                round(lerp(2.06, 2.18, t), 3),
+                round(lerp(3.02, 3.20, t), 3),
+                round(lerp(8.40, 8.90, t), 3),
+                round(lerp(0.88, 0.80, t), 3),
+                round(lerp(0.095, 0.09, t), 3),
+                round(lerp(3.00, 3.20, t), 3),
+                round(lerp(0.60, 0.70, t), 3),
+                round(lerp(1.46, 1.54, t), 3),
+                1.35,
+                round(lerp(1.56, 1.70, t), 3),
+                round(lerp(4.25, 4.60, t), 3),
+                round(lerp(2.45, 2.70, t), 3),
+                round(lerp(1.55, 1.80, t), 3),
+                iround(lerp(7, 8, t)),
+                iround(lerp(7, 8, t)),
+                iround(lerp(28, 32, t)),
+                iround(lerp(10, 12, t)),
+                iround(lerp(1750, 2200, t)),
+                iround(lerp(12, 14, t)),
+                iround(lerp(104, 132, t)),
+                iround(lerp(92, 108, t)),
+                iround(lerp(66, 86, t)),
+            )
+        )
 
     try:
         to_run = configs[: max(1, min(int(args.runs), len(configs)))]
@@ -432,31 +528,32 @@ def main() -> None:
         final_html = out_dir / "best_final_production.html"
         final_log = out_dir / "best_final_production.log"
         final_cmd = build_cmd(py=py, train_py=train_py, csv_path=args.csv, html_path=final_html, cfg=best_cfg)
-        # Upgrade to true production pass on best config.
-        final_cmd += [
-            "--tune-trials",
-            str(max(10, best_cfg.tune_trials + 2)),
-            "--tune-epochs",
-            str(max(10, best_cfg.tune_epochs + 4)),
-            "--multi-restarts",
-            "5",
-            "--final-epochs",
-            str(max(72, best_cfg.final_epochs * 2)),
-            "--backtest-epochs",
-            str(max(20, best_cfg.backtest_epochs + 8)),
-            "--blend-random-candidates",
-            str(max(3200, best_cfg.blend_random + 1200)),
-            "--blend-coordinate-iters",
-            str(max(16, best_cfg.blend_coord + 4)),
-            "--blend-simplex-iters",
-            str(max(180, best_cfg.blend_simplex + 60)),
-            "--candidate-max-pool",
-            str(max(128, best_cfg.candidate_pool + 28)),
-            "--candidate-gumbel-samples",
-            str(max(96, best_cfg.candidate_gumbel + 24)),
-            "--output-html",
-            str(final_html),
-        ]
+        # Optional heavier pass. Default is exact winner replay for stability/reproducibility.
+        if bool(args.final_upgrade):
+            final_cmd += [
+                "--tune-trials",
+                str(max(10, best_cfg.tune_trials + 2)),
+                "--tune-epochs",
+                str(max(10, best_cfg.tune_epochs + 4)),
+                "--multi-restarts",
+                "5",
+                "--final-epochs",
+                str(max(72, best_cfg.final_epochs * 2)),
+                "--backtest-epochs",
+                str(max(20, best_cfg.backtest_epochs + 8)),
+                "--blend-random-candidates",
+                str(max(3200, best_cfg.blend_random + 1200)),
+                "--blend-coordinate-iters",
+                str(max(16, best_cfg.blend_coord + 4)),
+                "--blend-simplex-iters",
+                str(max(180, best_cfg.blend_simplex + 60)),
+                "--candidate-max-pool",
+                str(max(128, best_cfg.candidate_pool + 28)),
+                "--candidate-gumbel-samples",
+                str(max(96, best_cfg.candidate_gumbel + 24)),
+                "--output-html",
+                str(final_html),
+            ]
 
         log_info(f"[FINAL] Running production pass from winner: {best_run_name}")
         final_exit_code = run_streamed(
@@ -475,6 +572,7 @@ def main() -> None:
             "sweep_dir": str(out_dir.relative_to(root)),
             "best_run": best,
             "best_cfg": best_cfg.__dict__,
+            "final_upgrade": bool(args.final_upgrade),
             "final_html": str(final_html.relative_to(root)),
             "final_log": str(final_log.relative_to(root)),
             "final_exit_code": final_exit_code,
